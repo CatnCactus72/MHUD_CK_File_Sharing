@@ -1,0 +1,7 @@
+=== SECURE FILE SHARING AUDIT LOG ===
+[2026-05-16T17:48:08.525103] [GROUP] User 'alice' created group 'group1'.
+[2026-05-16T17:48:53.031927] [FILE] User 'alice' uploaded file '3.jpg' to target 'bob'.
+[2026-05-16T17:50:00.088498] [FILE_DOWNLOAD] User 'bob' requested encrypted blob for file_id '68d8f20f-cbaa-4f1d-9248-7d3bafe2d040'.
+[2026-05-16T17:50:00.279944] [FILE_PURGE] Tệp tin file_id '68d8f20f-cbaa-4f1d-9248-7d3bafe2d040' đã được xóa hoàn toàn khỏi hệ thống bởi 'bob'.
+[2026-05-16T17:50:36.519646] [FILE] User 'bob' uploaded file 'newfile.txt' to target 'alice'.
+[2026-05-16T17:52:34.030250] [FILE] User 'bob' uploaded file 'BigInt.cpp' to target 'group1'.

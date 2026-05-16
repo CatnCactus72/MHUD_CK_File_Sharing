@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  ca_server:
+    build:
+      context: .
+      dockerfile: ./ca_server/Dockerfile
+    container_name: ca_server
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./ca_server/root_ca:/app/root_ca
+      - ./ca_server/intermediate_ca:/app/intermediate_ca
+    networks:
+      - secure_net
+
+  auth_server:
+    build:
+      context: .
+      dockerfile: ./auth_server/Dockerfile
+    container_name: auth_server
+    ports:
+      - "5002:5002"
+    # Ánh xạ trực tiếp từng tệp tin phẳng để lưu trữ lâu dài trên máy host
+    volumes:
+      - ./auth_server/nonce_store.db:/app/nonce_store.db
+      - ./auth_server/auth_priv_key.pem:/app/auth_priv_key.pem
+      - ./auth_server/auth_pub_key.pem:/app/auth_pub_key.pem
+    depends_on:
+      - ca_server
+    networks:
+      - secure_net
+
+  file_server:
+    build:
+      context: .
+      dockerfile: ./file_server/Dockerfile
+    container_name: file_server
+    ports:
+      - "5003:5003"
+    volumes:
+      - ./file_server/database:/app/database
+      - ./file_server/storage:/app/storage
+      - ./file_server/logs:/app/logs
+    depends_on:
+      - auth_server
+    networks:
+      - secure_net
+
+networks:
+  secure_net:
+    driver: bridge
