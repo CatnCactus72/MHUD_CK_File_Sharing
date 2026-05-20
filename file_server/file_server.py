@@ -287,8 +287,14 @@ def group_action(group_name):
             
         elif action == "remove":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
-            cursor.execute("DELETE FROM group_members WHERE group_name = ? AND username = ?", (group_name, data.get('target_user')))
-            # (Thực tế hệ thống sẽ cần kích hoạt Xoay vòng khóa ở Client sau bước này)
+            target_user = data.get('target_user')
+            
+            # Kiểm tra xem người dùng có tồn tại trong nhóm không
+            cursor.execute("SELECT 1 FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
+            if not cursor.fetchone():
+                return jsonify({"error": f"Thành viên '{target_user}' không tồn tại trong nhóm."}), 404
+                
+            cursor.execute("DELETE FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
             
         elif action == "edit_display_name":
             cursor.execute("UPDATE group_members SET display_name = ? WHERE group_name = ? AND username = ?", 
@@ -302,8 +308,15 @@ def group_action(group_name):
             
         elif action == "transfer_admin":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
-            cursor.execute("UPDATE groups SET admin = ? WHERE group_name = ?", (data.get('target_user'), group_name))
+            target_user = data.get('target_user')
             
+            # Kiểm tra xem người dùng có tồn tại trong nhóm không
+            cursor.execute("SELECT 1 FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
+            if not cursor.fetchone():
+                return jsonify({"error": f"Thành viên '{target_user}' không tồn tại trong nhóm."}), 404
+                
+            cursor.execute("UPDATE groups SET admin = ? WHERE group_name = ?", (target_user, group_name))
+
         elif action == "leave":
             cursor.execute("SELECT COUNT(*) FROM group_members WHERE group_name = ? AND status = 'active'", (group_name,))
             count = cursor.fetchone()[0]
@@ -398,29 +411,49 @@ def delete_file(file_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Xác thực tệp và kiểm tra quyền hạn xóa (chỉ người nhận hoặc người gửi mới có quyền)
-    cursor.execute("SELECT owner, target_group FROM files WHERE file_id = ?", (file_id,))
+    # Lấy thông tin chủ sở hữu, người nhận cá nhân và tên nhóm của tệp
+    cursor.execute("SELECT owner, target_group, group_name FROM files WHERE file_id = ?", (file_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "Không tìm thấy tệp tin"}), 404
+        return jsonify({"error": "Không tìm thấy tệp tin trên hệ thống"}), 404
         
-    if row[0] != request.user and row[1] != request.user:
+    owner, target_group, group_name = row
+    
+    can_delete = False
+    
+    if group_name:
+        # Nếu là FILE NHÓM: Truy xuất quyền Admin của nhóm
+        cursor.execute("SELECT admin FROM groups WHERE group_name = ?", (group_name,))
+        admin_row = cursor.fetchone()
+        group_admin = admin_row[0] if admin_row else None
+        
+        # Chỉ người gửi (owner) hoặc quản trị viên nhóm (admin) mới được xóa
+        if request.user == owner or request.user == group_admin:
+            can_delete = True
+    else:
+        # Nếu là FILE CÁ NHÂN: Người gửi hoặc người nhận đều có thể xóa
+        if request.user == owner or request.user == target_group:
+            can_delete = True
+
+    if not can_delete:
         conn.close()
-        return jsonify({"error": "Quyền truy cập bị từ chối"}), 403
+        return jsonify({"error": "Từ chối truy cập. Chỉ người gửi hoặc Quản trị viên nhóm mới được phép xóa tệp này."}), 403
 
     # Tiến hành xóa trong Database
     cursor.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
     conn.commit()
     conn.close()
 
-    # Tiến hành xóa file blob vật lý trong thư mục storage
+    # Xóa file vật lý
     file_path = os.path.join(STORAGE_DIR, file_id)
     if os.path.exists(file_path):
         os.remove(file_path)
 
-    write_audit_log("FILE_PURGE", f"Tệp tin file_id '{file_id}' đã được xóa hoàn toàn khỏi hệ thống bởi '{request.user}'.")
-    return jsonify({"message": "Đã xóa tệp tin khỏi danh sách chờ"}), 200
+    write_audit_log("FILE_PURGE", f"Tệp tin '{file_id}' đã bị xóa khỏi hệ thống bởi '{request.user}'.")
+    return jsonify({"message": "Đã xóa tệp tin khỏi hệ thống"}), 200
+
+
 if __name__ == '__main__':
     init_system()
     app.run(host='0.0.0.0', port=5003)

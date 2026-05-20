@@ -157,7 +157,29 @@ def show_pending_files():
         wrapped_fsk_hex = selected_file["wrapped_fsk"]
         group_context = selected_file.get("group_name")
 
-        print(f"[*] Đang tải xuống khối mã hóa (blob) của tệp '{filename}' từ File Server...")
+        # THÊM HỘP THOẠI XÁC NHẬN TẢI / XÓA BẢO MẬT
+        while True:
+            action = input(f"\n[?] Tải xuống file này? [Y/N/C]: ").strip().upper()
+            if action in ['Y', 'N', 'C']:
+                break
+            print("[-] Vui lòng chọn Y (Đồng ý tải), N (Xóa file), hoặc C (Quay lại menu).")
+
+        if action == 'C':
+            print("[*] Đã hủy thao tác.")
+            return
+
+        if action == 'N':
+            print(f"[*] Đang gửi yêu cầu xoá tệp tin '{filename}' lên Server...")
+            del_resp = requests.delete(f"{FILE_URL}/files/delete/{file_id}", headers=get_auth_headers())
+            if del_resp.status_code == 200:
+                print("[+] Đã tiêu hủy tệp tin an toàn khỏi hệ thống Server.")
+            else:
+                print("[-] Lỗi:", del_resp.json().get("error"))
+                print("[-] Chỉ admin và người sở hữu mới có thể xoá file. File vẫn sẽ hiển thị trên danh sách này.")
+            return
+
+        # NẾU ACTION == 'Y', TIẾN HÀNH TẢI VÀ GIẢI MÃ
+        print(f"\n[*] Đang tải xuống khối mã hóa (blob) của tệp '{filename}' từ File Server...")
         blob_resp = requests.get(f"{FILE_URL}/files/download/{file_id}", headers=get_auth_headers())
         if blob_resp.status_code != 200:
             print("[-] Tải khối dữ liệu thất bại.")
@@ -172,13 +194,10 @@ def show_pending_files():
             # --- LUỒNG XỬ LÝ MẬT MÃ KHÔI PHỤC KHÓA PHIÊN (FSK) ---
             if group_context:
                 print(f"[*] Phát hiện tệp thuộc Nhóm '{group_context}'. Tiến hành lấy gói khóa nhóm GMK...")
-                # Truy vấn thông tin nhóm để lấy wrapped_gmk của bản thân
                 detail_resp = requests.get(f"{FILE_URL}/group/{group_context}", headers=get_auth_headers())
-                
                 if detail_resp.status_code != 200:
                     print(f"[-] Lỗi Server (Mã {detail_resp.status_code}): Không thể lấy gói khóa nhóm.")
                     return
-
                 group_data = detail_resp.json()
                 my_wrapped_gmk_hex = next(m['wrapped_gmk'] for m in group_data['members'] if m['username'] == current_user)
                 
@@ -189,7 +208,6 @@ def show_pending_files():
                 )
                 
                 print("[*] Đang dùng khóa nhóm GMK mở bọc đối xứng (Symmetric Unwrapping) lấy khóa phiên FSK...")
-                # Giải mã khóa FSK được bọc trong GMK bằng AES-GCM (12 byte IV đầu)
                 wrapped_fsk_bytes = bytes.fromhex(wrapped_fsk_hex)
                 gmk_aes = AESGCM(gmk_bytes)
                 fsk = gmk_aes.decrypt(wrapped_fsk_bytes[:12], wrapped_fsk_bytes[12:], None)
@@ -211,9 +229,15 @@ def show_pending_files():
                 f.write(plaintext)
             print(f"[+] THÀNH CÔNG: Tệp rõ đã giải mã cục bộ lưu tại: {output_path}")
             
-            # Xóa file tạm trên hàng đợi Server
-            requests.delete(f"{FILE_URL}/files/delete/{file_id}", headers=get_auth_headers())
-            print("[+] Đã xóa vết tệp tin khỏi hàng đợi hàng lưu trữ tạm của Server.")
+            # --- XỬ LÝ XÓA SAU KHI TẢI XONG ---
+            if not group_context:
+                # File cá nhân: Tự động xóa sau khi người nhận tải thành công
+                print("[*] Đang dọn dẹp tệp tin cá nhân khỏi hàng đợi...")
+                requests.delete(f"{FILE_URL}/files/delete/{file_id}", headers=get_auth_headers())
+                print("[+] Đã xóa vết tệp tin khỏi hàng đợi tạm của Server.")
+            else:
+                # File nhóm: Giữ nguyên trên Server để các thành viên khác có thể tải
+                print("[i] LƯU Ý: Tệp tin nhóm vẫn được giữ trên Server cho các thành viên khác.")
             
         except Exception as decrypt_err:
             print("[-] Thất bại mật mã: Khóa lỗi hoặc bạn đã bị trục xuất khỏi danh sách mật mã của nhóm.")
@@ -513,10 +537,15 @@ def group_detail_menu(group_name, admin_username):
             ans = input(f"Xác nhận xóa '{target}' khỏi nhóm? (Y/N): ").strip().upper()
             if ans == 'Y':
                 print(f"[*] Đang gửi yêu cầu hủy phiên của '{target}' lên Server...")
-                requests.post(f"{FILE_URL}/group/{group_name}/action", headers=get_auth_headers(), json={"action": "remove", "target_user": target})
-                print("[+] Thành viên đã bị xóa.")
-                print("[!] BẢO MẬT: Giao thức Xoay vòng khóa (Key Rotation - Mục 4.4) đã được kích hoạt. Hãy tạo GMK mới để chặn Forward Secrecy!")
-                break # Quay lại danh sách
+                resp = requests.post(f"{FILE_URL}/group/{group_name}/action", headers=get_auth_headers(), json={"action": "remove", "target_user": target})
+                
+                # Bổ sung kiểm tra kết quả từ Server
+                if resp.status_code == 200:
+                    print("[+] Thành viên đã bị xóa.")
+                    print("[!] BẢO MẬT: Giao thức Xoay vòng khóa (Key Rotation - Mục 4.4) đã được kích hoạt. Hãy tạo GMK mới để chặn Forward Secrecy!")
+                    break # Quay lại danh sách
+                else:
+                    print("[-] Lỗi:", resp.json().get("error"))
 
         elif choice == '4':
             new_name = input("Nhập tên hiển thị mới của bạn: ").strip()
@@ -536,9 +565,14 @@ def group_detail_menu(group_name, admin_username):
             ans = input(f"Xác nhận chuyển quyền Admin cho '{target}'? Bạn sẽ mất quyền quản trị. (Y/N): ").strip().upper()
             if ans == 'Y':
                 print("[*] Đang thay đổi cấu trúc phân quyền trên cơ sở dữ liệu Server...")
-                requests.post(f"{FILE_URL}/group/{group_name}/action", headers=get_auth_headers(), json={"action": "transfer_admin", "target_user": target})
-                is_admin = False
-                print("[+] Chuyển quyền quản trị viên thành công.")
+                resp = requests.post(f"{FILE_URL}/group/{group_name}/action", headers=get_auth_headers(), json={"action": "transfer_admin", "target_user": target})
+                
+                # Bổ sung kiểm tra kết quả từ Server
+                if resp.status_code == 200:
+                    is_admin = False
+                    print("[+] Chuyển quyền quản trị viên thành công.")
+                else:
+                    print("[-] Lỗi:", resp.json().get("error"))
 
         elif choice == '7':
             ans = input(f"Bạn muốn rời khỏi nhóm '{group_name}'? (Y/N): ").strip().upper()
