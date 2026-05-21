@@ -1,402 +1,607 @@
-# Secure File Sharing System — Project Specification
+# Hệ Thống Chia Sẻ Tệp Tin Bảo Mật
+
+> Đồ án môn học — Mật mã ứng dụng & An toàn thông tin  
+> Mô hình Client–Server, triển khai hoàn toàn trên Docker
 
 ---
 
-## 1. Project Objective
+## Mục lục
 
-Build a secure, end-to-end encrypted file sharing system based on a Client–Server model, running entirely on Docker. The core guarantee is **zero server knowledge**: all file content is encrypted on the client before transmission, and the server stores only ciphertext it cannot read. Only the intended recipients (individuals or group members) can decrypt received files.
+1. [Tổng quan dự án](#1-tổng-quan-dự-án)
+2. [Kiến trúc hệ thống](#2-kiến-trúc-hệ-thống)
+3. [Thiết kế mật mã học](#3-thiết-kế-mật-mã-học)
+4. [Cơ sở dữ liệu](#4-cơ-sở-dữ-liệu)
+5. [Hướng dẫn cài đặt & chạy](#5-hướng-dẫn-cài-đặt--chạy)
+6. [Luồng hoạt động của ứng dụng](#6-luồng-hoạt-động-của-ứng-dụng)
+7. [Cấu trúc thư mục dự án](#7-cấu-trúc-thư-mục-dự-án)
+8. [Công cụ tiện ích](#8-công-cụ-tiện-ích)
+9. [Bảng tổng hợp yêu cầu đã đạt](#9-bảng-tổng-hợp-yêu-cầu-đã-đạt)
 
 ---
 
-## 2. System Architecture
+## 1. Tổng quan dự án
 
-The system is structured into **four components** across three Docker containers plus a terminal client.
+Hệ thống cho phép người dùng chia sẻ tệp tin với nhau (theo cá nhân hoặc theo nhóm) với đảm bảo cốt lõi: **Server không thể đọc nội dung tệp tin**. Toàn bộ quá trình mã hóa và giải mã xảy ra hoàn toàn tại máy Client. Dữ liệu lưu trên Server chỉ là các khối mã hóa nhị phân (ciphertext) mà Server không có khóa để giải mã.
 
-### Node 1 — CA Server (PKI)
-Handles all certificate operations:
-- Generating RSA key pairs and issuing X.509 certificates for new users
-- Maintaining the Certificate Revocation List (CRL)
-- Providing a CRL distribution endpoint that clients and servers can fetch from
-- Signing certificates through a two-tier chain: Root CA → Intermediate CA → User Certificate
+**Các tính năng chính:**
 
-### Node 2 — Auth Server (KDC / SSO)
-Handles identity and session management:
-- Accepting username and password at login
-- Verifying the user's X.509 certificate against the CA chain and CRL before issuing a session ticket
-- Issuing a signed Session Ticket (JWT-style, RSA-signed) that encodes the username, issue time, and expiry
-- Maintaining a **Nonce Store** (small persistent database, e.g., SQLite) that records used nonces with their timestamps, to enable replay attack detection; nonces older than the configured TTL window (e.g., 5 minutes) are automatically purged
+- Đăng ký tài khoản kèm cấp phát chứng chỉ số X.509 tự động qua hệ thống PKI hai tầng
+- Đăng nhập một lần (SSO) với Session Ticket ký số RS256, hiệu lực 2 giờ
+- Chia sẻ tệp tin mã hóa đầu cuối cho cá nhân hoặc nhóm
+- Quản lý nhóm với phân quyền Admin/Member rõ ràng
+- Bảo vệ chống tấn công phát lại (Replay Attack) bằng cơ chế Nonce + Timestamp
+- Ghi nhật ký kiểm toán (Audit Log) toàn bộ giao dịch hệ thống
 
-### Node 3 — File Server (Resource Server)
-Handles all file and group operations:
-- Storing encrypted file blobs, group metadata, and member lists
-- Validating every incoming request by: (a) verifying the Session Ticket signature, (b) checking the nonce/timestamp pair against its own Nonce Store to reject replays
-- Storing wrapped key material (File Session Keys encrypted per-recipient), but never holding plaintext keys or file content
-- Providing a **Public Key Registry**: upon request, returns any user's X.509 certificate so the caller can extract their public key; the caller is responsible for verifying the certificate chain before trusting the key
+---
+
+## 2. Kiến trúc hệ thống
+
+Hệ thống được triển khai trên **4 Docker container** giao tiếp qua mạng nội bộ `secure_net`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DOCKER NETWORK: secure_net               │
+│                                                                  │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐ │
+│  │  CA Server   │   │ Auth Server  │   │    File Server       │ │
+│  │  Port: 5001  │◄──│  Port: 5002  │◄──│    Port: 5003        │ │
+│  │  (PKI/CRL)   │   │ (SSO / KDC)  │   │ (Tệp tin & Nhóm)    │ │
+│  └──────────────┘   └──────┬───────┘   └─────────┬────────────┘ │
+│                            │                     │              │
+│                     ┌──────▼─────────────────────▼───────────┐  │
+│                     │        PostgreSQL (Port: 5432)          │  │
+│                     │         secure_file_sharing DB          │  │
+│                     └─────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+              ▲                    ▲
+              │ HTTP               │ HTTP
+              └────────┬───────────┘
+                ┌──────┴──────┐
+                │   Client    │
+                │  (Terminal) │
+                │  localhost  │
+                └─────────────┘
+```
+
+### Node 1 — CA Server (Port 5001)
+
+Container chuyên trách toàn bộ nghiệp vụ PKI (Public Key Infrastructure):
+
+- Tự động khởi tạo chuỗi CA hai tầng tại lần boot đầu tiên:
+  - **Root CA** (RSA-4096, tự ký, hiệu lực 10 năm)
+  - **Intermediate CA** (RSA-4096, ký bởi Root CA, hiệu lực 10 năm)
+- Tiếp nhận CSR từ Auth Server, ký và phát hành **chứng chỉ người dùng X.509** (RSA-2048, hiệu lực 1 năm) bằng Intermediate CA
+- Trả về chuỗi chứng chỉ đầy đủ: `User Cert → Intermediate CA Cert → Root CA Cert`
+- Quản lý và cung cấp **CRL (Certificate Revocation List)** qua endpoint công khai `/crl`
+
+| Endpoint | Phương thức | Mô tả |
+|---|---|---|
+| `/issue_cert` | POST | Tiếp nhận CSR, ký và trả về chuỗi chứng chỉ |
+| `/crl` | GET | Tải danh sách thu hồi chứng chỉ (CRL) |
+
+### Node 2 — Auth Server (Port 5002)
+
+Container xử lý xác thực danh tính người dùng (KDC/SSO):
+
+- **Đăng ký**: Tiếp nhận thông tin và CSR của người dùng; đóng vai trò RA (Registration Authority) chuyển tiếp CSR đến CA Server; lưu hash mật khẩu (Werkzeug PBKDF2) và chuỗi chứng chỉ vào database
+- **Đăng nhập**: Xác minh mật khẩu, kiểm tra CRL, phát hành **Session Ticket** dạng JWT (RS256) với trường `{username, iat, exp}` — hiệu lực 2 giờ
+- **Nonce Store**: Lưu vết nonce đã sử dụng vào bảng `nonces` (PostgreSQL), TTL 5 phút, tự động dọn dẹp
+- **Public Key Registry**: Cung cấp chứng chỉ X.509 của bất kỳ người dùng nào theo yêu cầu (để bên gửi trích xuất Public Key của bên nhận)
+
+| Endpoint | Phương thức | Mô tả |
+|---|---|---|
+| `/register` | POST | Đăng ký tài khoản mới + yêu cầu CA cấp chứng chỉ |
+| `/login` | POST | Xác thực và phát hành Session Ticket JWT |
+| `/public_key` | GET | Lấy Public Key RSA của Auth Server (để File Server xác minh JWT) |
+| `/registry/<username>` | GET | Lấy chứng chỉ X.509 của người dùng bất kỳ |
+
+### Node 3 — File Server (Port 5003)
+
+Container lưu trữ và quản lý toàn bộ tài nguyên:
+
+- **Xác thực mọi request** qua decorator `@require_auth`: kiểm tra JWT (RS256 với Public Key lấy từ Auth Server), đồng thời kiểm tra Nonce + Timestamp chống Replay Attack
+- **Lưu trữ blob mã hóa** trên ổ đĩa (`./storage/<file_id>`) — Server chỉ thấy ciphertext
+- **Lưu trữ wrapped key** (`wrapped_fsk`, `wrapped_gmk`) trong database — Server không có khóa để giải mã
+- **Quản lý nhóm**: tạo nhóm, mời thành viên, phân quyền Admin, lưu danh sách thành viên và trạng thái lời mời
+- **Ghi Audit Log** tại `./logs/audit_log.txt` cho mọi giao dịch
+
+| Endpoint | Phương thức | Mô tả |
+|---|---|---|
+| `/upload` | POST | Tải blob mã hóa + wrapped_fsk lên server |
+| `/files/pending` | GET | Lấy danh sách tệp chờ xử lý |
+| `/files/download/<file_id>` | GET | Tải blob nhị phân mã hóa |
+| `/files/delete/<file_id>` | DELETE | Xóa tệp khỏi database và ổ đĩa |
+| `/groups/me` | GET | Lấy danh sách nhóm (active) và lời mời (pending) |
+| `/group/create` | POST | Tạo nhóm mới kèm wrapped GMK |
+| `/group/<name>` | GET | Lấy thông tin nhóm + danh sách wrapped GMK thành viên |
+| `/group/<name>/members` | GET | Lấy danh sách thành viên |
+| `/group/<name>/action` | POST | Xử lý đa năng: mời, chấp nhận, từ chối, xóa, đổi tên, chuyển quyền, rời, xóa nhóm |
+
+### Container PostgreSQL (Port 5432)
+
+Database dùng chung cho cả Auth Server và File Server. Dữ liệu được bảo toàn qua Docker volume `pgdata`.
 
 ### Client (Terminal App)
-The only component that handles plaintext:
-- All AES encryption and decryption of file content happens here
-- Performs X.509 certificate chain verification before using any public key
-- Manages the user's own private key and a local **encrypted key store** (see Section 4.3)
-- Generates nonces and timestamps for every request sent to the File Server
+
+Ứng dụng dòng lệnh chạy trên máy người dùng, **thành phần duy nhất tiếp xúc với dữ liệu rõ (plaintext)**:
+
+- Sinh cặp khóa RSA-2048 và tạo CSR ngay trên máy cục bộ khi đăng ký
+- Lưu trữ Private Key và chứng chỉ X.509 tại `./client_data/<username>/` (cô lập theo người dùng)
+- Thực hiện toàn bộ mã hóa/giải mã AES-256-GCM và bọc khóa RSA-OAEP
+- Gắn `Authorization: Bearer <JWT>`, `X-Nonce`, `X-Timestamp` vào mọi request gửi đến File Server
 
 ---
 
-## 3. Execution
+## 3. Thiết kế mật mã học
 
-The entire system runs via Docker Compose. A single `docker-compose up` command starts all three server containers. The client is a terminal application run separately (e.g., `python client.py`).
+### 3.1 Phân cấp khóa
+
+```
+Root CA Key (RSA-4096, tự ký)
+  └── Intermediate CA Key (RSA-4096, ký bởi Root CA)
+        └── User Certificate (RSA-2048, X.509, ký bởi Intermediate CA)
+                └── Group Master Key — GMK (AES-256, sinh ngẫu nhiên)
+                          └── File Session Key — FSK (AES-256, sinh ngẫu nhiên)
+                                    └── Nội dung tệp tin mã hóa (AES-256-GCM)
+```
+
+### 3.2 Mã hóa và tải tệp lên
+
+#### Chia sẻ cho cá nhân
+
+```
+[CLIENT - BÊN GỬI]
+1. Sinh FSK ngẫu nhiên (AES-256)
+2. Mã hóa nội dung tệp:  IV(12B) || AES-256-GCM(FSK, plaintext)  →  encrypted_blob
+3. Truy xuất cert X.509 của người nhận từ /registry/<username> (Auth Server)
+4. Bọc FSK:  RSA-OAEP(PublicKey_người_nhận, FSK)  →  wrapped_fsk
+5. Upload encrypted_blob + wrapped_fsk lên File Server
+```
+
+#### Chia sẻ lên nhóm
+
+```
+[CLIENT - BÊN GỬI]
+1. Tải wrapped_gmk của bản thân từ File Server
+2. Giải mã GMK:  RSA-OAEP-Decrypt(PrivateKey_mình, wrapped_gmk)  →  gmk (bytes rõ, trong RAM)
+3. Sinh FSK ngẫu nhiên (AES-256)
+4. Mã hóa nội dung tệp:  IV_file(12B) || AES-256-GCM(FSK, plaintext)  →  encrypted_blob
+5. Bọc FSK bằng GMK:  IV_wrap(12B) || AES-256-GCM(GMK, FSK)  →  wrapped_fsk
+6. Upload encrypted_blob + wrapped_fsk + group_name lên File Server
+```
+
+### 3.3 Tải tệp xuống và giải mã
+
+#### Tệp cá nhân
+
+```
+[CLIENT - BÊN NHẬN]
+1. Tải encrypted_blob và wrapped_fsk từ File Server
+2. Giải mã FSK:  RSA-OAEP-Decrypt(PrivateKey_mình, wrapped_fsk)  →  fsk
+3. Giải mã nội dung:  AES-256-GCM-Decrypt(FSK, IV, ciphertext)  →  plaintext
+4. Lưu tệp rõ vào  client_data/<username>/decrypted_<filename>
+5. Tự động xóa tệp khỏi hàng đợi trên Server (tệp cá nhân chỉ tải một lần)
+```
+
+#### Tệp nhóm
+
+```
+[CLIENT - THÀNH VIÊN NHÓM]
+1. Tải encrypted_blob và wrapped_fsk từ File Server
+2. Tải wrapped_gmk của bản thân từ thông tin nhóm (File Server)
+3. Giải mã GMK:  RSA-OAEP-Decrypt(PrivateKey_mình, wrapped_gmk)  →  gmk
+4. Giải mã FSK:  AES-256-GCM-Decrypt(GMK, IV_wrap, wrapped_fsk[12:])  →  fsk
+5. Giải mã nội dung:  AES-256-GCM-Decrypt(FSK, IV_file, ciphertext)  →  plaintext
+6. Lưu tệp rõ vào  client_data/<username>/decrypted_<filename>
+7. Tệp nhóm vẫn giữ trên Server để các thành viên khác tiếp tục tải
+```
+
+### 3.4 Lưu trữ Group Master Key (GMK)
+
+GMK **không bao giờ lưu dạng rõ** trên Server. Cơ chế lưu trữ thực tế:
+
+- **Tạo nhóm**: Client sinh GMK ngẫu nhiên → mã hóa bằng RSA-OAEP với Public Key của chính mình → lưu `wrapped_gmk` vào bảng `group_members` của File Server
+- **Mời thành viên**: Admin giải mã GMK bằng Private Key cục bộ → mã hóa lại bằng RSA-OAEP với Public Key của thành viên mới → lưu `wrapped_gmk` riêng cho thành viên mới vào database
+- **Chấp nhận lời mời**: Client tải `wrapped_gmk` về → giải mã bằng Private Key → GMK tồn tại trong RAM phiên làm việc
+- **Mỗi thành viên** có một bản `wrapped_gmk` riêng được mã hóa với Public Key của chính họ; Server không thể suy ra GMK từ bất kỳ bản nào
+
+> **Lưu ý — Xoay vòng khóa (Key Rotation):** Khi Admin xóa thành viên, hệ thống hiển thị cảnh báo nhắc Admin cần tạo nhóm mới hoặc thực hiện xoay vòng GMK thủ công để đảm bảo thành viên bị xóa không giải mã được các tệp tải lên sau đó.
+
+### 3.5 Bảo vệ chống Replay Attack (Nonce + Timestamp)
+
+Mọi request gửi đến Auth Server và File Server đều bao gồm:
+
+- **`X-Nonce`**: Chuỗi ngẫu nhiên 128-bit dạng hex, duy nhất mỗi request, sinh bởi `secrets.token_hex(16)`
+- **`X-Timestamp`**: Thời điểm gửi request theo chuẩn ISO 8601 UTC
+
+Server kiểm tra **hai bước tuần tự**:
+
+1. Timestamp phải nằm trong cửa sổ ±5 phút so với giờ Server; nếu lệch → `403 Request timestamp out of window.`
+2. Nonce chưa từng được dùng trước đó (tra cứu bảng `nonces` PostgreSQL); nếu trùng → `403 Replay Attack Detected: Nonce already used!`
+
+Nonce hợp lệ được ghi vào database. Các nonce cũ hơn 5 phút được tự động xóa trước mỗi lần kiểm tra.
+
+### 3.6 Xác thực Session Ticket (JWT RS256)
+
+File Server xác minh mọi request qua decorator `@require_auth`:
+
+1. Trích xuất `Authorization: Bearer <token>`, `X-Nonce`, `X-Timestamp` từ header
+2. Kiểm tra Nonce + Timestamp (mục 3.5)
+3. Tải Public Key của Auth Server từ `/public_key` (lazy-load, cache vào biến toàn cục)
+4. Giải mã và xác minh JWT bằng `PyJWT` (thuật toán RS256)
+5. Gắn `request.user = payload['username']` — mọi handler sau dùng để phân quyền
+
+File Server **không liên hệ lại Auth Server** trong từng request; chỉ dùng Public Key đã cache để xác minh chữ ký JWT cục bộ.
+
+### 3.7 Kiểm tra CRL khi đăng nhập
+
+Tại bước đăng nhập, Auth Server:
+
+1. Tải CRL từ CA Server (`/crl`)
+2. Tải chứng chỉ X.509 của người dùng từ database
+3. So sánh `serial_number` của chứng chỉ với từng mục trong CRL
+4. Nếu khớp → trả về `403 Certificate revoked. Access denied.` và từ chối phát hành Ticket
 
 ---
 
-## 4. Cryptographic Design
+## 4. Cơ sở dữ liệu
 
-### 4.1 Key Hierarchy
+Database PostgreSQL `secure_file_sharing` chứa các bảng sau:
 
-```
-Root CA Key
-  └── Intermediate CA Key
-        └── User Certificate (RSA-2048 key pair, X.509)
-                └── Group Master Key (AES-256, one per group)
-                          └── File Session Key (AES-256, one per file upload)
-                                    └── Encrypted File Content
-```
+### Bảng `users` (Auth Server quản lý)
 
-### 4.2 File Upload Encryption Protocol
-
-When a user uploads a file to share with a group or individual:
-
-1. **Generate a File Session Key (FSK):** a fresh random AES-256 key, created for this file only.
-2. **Encrypt the file content** with the FSK using AES-256-GCM. This produces the encrypted blob.
-3. **Wrap the FSK:**
-   - For a **group share**: retrieve the Group Master Key (GMK) from the local key store. Encrypt the FSK with the GMK (AES key wrapping, e.g., AES-KW or AES-GCM). The server receives one wrapped FSK that all current group members can unwrap using the GMK.
-   - For an **individual share**: for each recipient, fetch their X.509 certificate from the File Server's Public Key Registry. Verify the certificate chain (Intermediate CA → Root CA) before proceeding. Extract the recipient's RSA public key. Encrypt the FSK with RSA-OAEP. The server receives one wrapped FSK per recipient.
-4. **Upload** the encrypted blob and all wrapped FSK copies to the File Server. The server stores them but cannot read the FSK or the file content.
-
-### 4.3 Group Master Key (GMK) Storage
-
-The GMK is generated on the client at group creation time and must persist across sessions. It is **never sent to the server in plaintext**. Storage works as follows:
-
-- The client derives a **Key Encryption Key (KEK)** from the user's password using PBKDF2 (or Argon2) with a per-user salt stored on the File Server.
-- The GMK is encrypted with the KEK and stored as an encrypted blob on the File Server (one blob per user per group).
-- At login, after receiving a valid Session Ticket, the client fetches its encrypted GMK blobs and decrypts them locally using the KEK derived from the entered password.
-- This means the server holds encrypted GMKs but has no KEK, so it cannot derive the GMK.
-
-### 4.4 Group Key Rotation (After Member Deletion)
-
-When an administrator removes a member from a group, the GMK must be rotated so the removed member cannot decrypt future uploads:
-
-1. The admin's client generates a new GMK v2 (random AES-256 key).
-2. The client fetches the current member list from the File Server.
-3. For each remaining member, the client fetches their X.509 certificate from the Public Key Registry, verifies the chain, and re-encrypts GMK v2 with that member's RSA public key (RSA-OAEP).
-4. The client uploads all re-wrapped GMK v2 copies to the File Server in a single atomic operation, replacing the old GMK blobs.
-5. The terminal prints: `Generating new Group Key v2... Redistributing key to N remaining members... Done.`
-6. Files uploaded before the rotation remain encrypted under GMK v1; the deleted member retains access to those only. All new uploads use GMK v2.
-
-### 4.5 Replay Attack Protection
-
-Every request from the client to the File Server (and Auth Server) includes:
-- A **Nonce**: a 128-bit random string, hex-encoded, unique per request.
-- A **Timestamp**: ISO 8601 UTC timestamp of request creation.
-
-The server checks:
-1. The timestamp is within the acceptable window (e.g., ±5 minutes of server time).
-2. The nonce has not been seen before (checked against the Nonce Store).
-
-If either check fails, the server responds with `403 Replay Attack Detected: Nonce already used!` or `403 Request timestamp out of window.` and does not execute the request.
-
-The Nonce Store persists to disk (survives container restarts) and automatically purges entries older than the TTL window.
-
-### 4.6 X.509 Certificate Verification and MITM Protection
-
-- Every client connection to any server verifies the server's TLS certificate against the CA chain. If the chain is invalid or untrusted, the client aborts: `Warning: Server certificate is invalid (Untrusted). Connection interrupted.`
-- Before using any user's public key, the client retrieves and verifies that user's X.509 certificate: the certificate must be signed by the Intermediate CA, which must be signed by the Root CA, and must not appear on the current CRL.
-- The CRL is fetched from the CA Server's distribution endpoint at login and cached for the session. Fetch failures are treated as errors (fail-closed, not fail-open).
-
----
-
-## 5. User Registration and Certificate Issuance
-
-When a new user selects "Register":
-
-1. The client generates an RSA-2048 key pair locally.
-2. The client sends a Certificate Signing Request (CSR) to the Auth Server, which acts as the Registration Authority (RA).
-3. The RA forwards the CSR to the CA Server.
-4. The CA Server validates the request, signs the certificate using the Intermediate CA key, and returns the certificate chain (`cert.pem`).
-5. The Auth Server returns the certificate to the client, which stores it locally.
-6. The terminal prints: `Certificate request sent to CA Server... Success!`
-
----
-
-## 6. Login and SSO Flow
-
-1. The user enters their username and password in the terminal.
-2. The client connects to the Auth Server (verifying the server's certificate first).
-3. The Auth Server looks up the user's certificate, verifies the chain and CRL status.
-   - If the certificate is revoked: `Certificate revoked. Access denied.`
-   - If the chain is invalid: authentication fails.
-4. The Auth Server verifies the password hash.
-5. On success, the Auth Server issues a **Session Ticket**: a signed JSON payload containing `{username, issued_at, expires_at}`, signed with the Auth Server's RSA private key.
-6. The client stores the Session Ticket in memory for the duration of the session. All subsequent requests to the File Server include this ticket in the request header.
-7. The File Server verifies the ticket signature using the Auth Server's public key (pre-shared at deployment). It does not contact the Auth Server again; it only checks the signature and expiry.
-8. Audit log entry: `[AUTH] User 'username' logged in successfully. Ticket issued.`
-
----
-
-## 7. Application UI — Screen Flows
-
-### 7.1 Entry Screen
-
-```
-1. Login
-2. Register
-0. Exit
-```
-
-Username may contain only alphanumeric characters.
-
----
-
-### 7.2 Main Menu
-
-After login, the following menu is displayed. An asterisk (`*`) appears next to any section with pending items.
-
-```
-1. Pending Files (N*)
-2. Upload File
-3. My Groups (N*)
-0. Logout
-```
-
----
-
-### 7.3 Pending Files
-
-Displays a list of files that have been shared with the user and are ready to download.
-
-**Columns:** #, Group / Sender, Sender Username, File Name, Uploaded At
-
-Below the list:
-```
-Select file number to continue:
-```
-
-After selecting a file:
-```
-1. Download file
-2. Delete file
-0. Back
-```
-
-- **Download file:** the client fetches the encrypted blob and the wrapped FSK from the File Server. It decrypts the FSK (using either the GMK from the local key store, or the user's RSA private key for individual shares), then decrypts the file content. The file is saved to the user's specified local path. Upon successful download, the file is removed from the Pending Files list to save server storage.
-- **Delete file:** removes the file from the Pending Files list without downloading. A confirmation prompt is shown first.
-
----
-
-### 7.4 Upload File
-
-**Step 1:**
-```
-1. Share with group
-2. Share with individual
-0. Back
-```
-
-**Step 2a — Share with group:** displays the list of groups the user belongs to. Prompts:
-```
-Enter group name or number:
-```
-
-**Step 2b — Share with individual:** prompts:
-```
-Enter recipient usernames (comma-separated, no spaces):
-```
-
-**Step 3:** prompts:
-```
-Enter path to file:
-```
-
-The client checks that the file exists at the given path. If not found, an error is shown and the user is returned to Step 3.
-
-**Step 4:** if the file is found:
-```
-Upload '[filename]' to [target]? (Y/N):
-```
-
-If confirmed, the client performs the encryption protocol (Section 4.2) and uploads to the File Server. If cancelled: `File upload cancelled.` and returns to the main menu.
-
-Audit log entry on success: `[FILE] User 'username' uploaded file 'filename' to Group/User 'target'.`
-
----
-
-### 7.5 My Groups
-
-```
-1. View my groups
-2. Group invitations (N*)
-3. Create group
-0. Back
-```
-
-#### View My Groups
-
-Displays a table of groups the user belongs to.
-
-**Columns:** #, Group Name, Admin Username, Created At, Member Count
-
-Prompt:
-```
-Enter group name or number to continue:
-```
-
-After selecting a group, the following menu is shown. Options 2, 3, 5, 6, and 8 are visible only to the group admin. If a non-admin user presses a restricted option number, the system responds: `Access Denied: Only administrators can perform this action.`
-
-```
-1. View members
-2. Add member          [admin only]
-3. Remove member       [admin only]
-4. Edit my display name
-5. Edit group name     [admin only]
-6. Transfer admin      [admin only]
-7. Leave group
-8. Delete group        [admin only]
-0. Back
-```
-
-**View members:** displays member list with columns: #, Display Name, Username.
-
-**Add member:** prompts for a username. The client fetches the target user's certificate, verifies the chain and CRL status, then prompts the File Server to add the user. The server also sends a group invitation to that user. The GMK is not redistributed at add time — the new member will receive it via their invitation acceptance flow (see Section 7.5, Group Invitations).
-
-**Remove member:** prompts for a username. Confirms:
-```
-Remove 'username' from group? (Y/N):
-```
-On confirmation, triggers the key rotation protocol (Section 4.4). Returns to the group list after completion.
-
-**Edit my display name:** prompts the user to enter a new display name for themselves within this group. Updates the File Server record.
-
-**Edit group name:** prompts for a new group name (admin only). Updates the group record on the File Server.
-
-**Transfer admin:** prompts for a username. Confirms:
-```
-Transfer admin rights to 'username'? (Y/N):
-```
-On confirmation, the target user becomes admin and the current user becomes a regular member.
-
-**Leave group:** if the user is the admin and there are other members, they must first transfer admin rights before leaving. The system will prompt: `You are the admin. Transfer admin rights before leaving. Use option 6.` If the user is the only member, they may leave (which effectively deletes the group). Otherwise, confirms:
-```
-Leave group 'groupname'? (Y/N):
-```
-
-**Delete group:** admin only. Removes the group, all stored file blobs associated with it, and all member records. Confirms:
-```
-Delete group 'groupname' and all its files? This cannot be undone. (Y/N):
-```
-
-#### Group Invitations
-
-Displays pending invitations.
-
-**Columns:** #, Group Name, Admin Username
-
-Prompt:
-```
-Select invitation number to continue:
-```
-
-After selecting:
-```
-Accept invitation to 'groupname'? (Y/N):
-0. Back
-```
-
-If accepted:
-```
-Enter your display name in this group:
-```
-
-The client notifies the File Server, which delivers the GMK (encrypted with the new member's RSA public key) to the client. The client decrypts the GMK using its RSA private key, then re-encrypts it under the KEK and stores it in the local key store. The invitation is removed from the list.
-
-If declined, the invitation is removed from the list without joining.
-
-#### Create Group
-
-Prompts:
-```
-Enter new group name:
-```
-
-The client generates a random AES-256 GMK, encrypts it under the user's KEK, and stores the encrypted blob on the File Server. The user is set as admin. Audit log entry: `[GROUP] User 'username' created group 'groupname'.`
-
----
-
-## 8. Audit Logging
-
-All significant events are appended to a persistent `audit_log.txt` file on the File Server (or a dedicated database table). Log entries follow this format:
-
-```
-[DD-MM-YYYY HH:MM:SS] [CATEGORY] Description
-```
-
-**Categories and example entries:**
-
-```
-[AUTH]  User 'nam_123' logged in successfully. Ticket issued.
-[AUTH]  User 'nam_123' failed login (invalid password).
-[AUTH]  User 'hacker_99' login rejected (certificate revoked).
-[FILE]  User 'nam_123' uploaded file 'doc1.pdf' to Group 'Nhom_KMA'.
-[FILE]  User 'nam_123' downloaded file 'doc1.pdf'.
-[FILE]  User 'nam_123' deleted pending file 'doc1.pdf'.
-[GROUP] User 'nam_123' created group 'Nhom_KMA'.
-[GROUP] Admin 'nam_123' removed user 'user_456' from group 'Nhom_KMA'. Key rotated.
-[GROUP] Admin 'nam_123' transferred admin rights to 'user_789' in group 'Nhom_KMA'.
-[PKI]   CA Server issued certificate for user 'nam_123'.
-[PKI]   CA Server revoked certificate for user 'hacker_99'. CRL updated.
-[SECURITY] Replay attack detected: nonce 'abc123' already used. Request rejected.
-```
-
----
-
-## 9. Level Summary
-
-| Level | Requirement | Implementation |
+| Cột | Kiểu | Mô tả |
 |---|---|---|
-| Basic | AES-256 + RSA hybrid encryption | File Session Key encrypted with GMK or RSA public key; blobs encrypted with FSK |
-| Basic | Key lifecycle (generation, rotation) | GMK generated at group creation; rotated with new member list re-encryption on member removal |
-| Basic | Nonce + timestamp replay protection | All requests include nonce + timestamp; File Server validates against persistent Nonce Store |
-| Basic | Public key source authentication | Public keys delivered via X.509 certificates; chain verified before use |
-| Good | Master Key vs Session Key separation | GMK is master; FSK is per-file session key; FSK wrapped under GMK |
-| Good | Identity-based access control | Admin-only actions enforced server-side; client-side enforcement is UI only |
-| Good | X.509, CRL, MITM protection | Full chain validation on every cert; CRL checked at login; server cert verified on connect |
-| Advanced | Three Docker containers (CA, Auth, File) | Separate containers with defined responsibilities |
-| Advanced | PKI with certificate chain | Root CA → Intermediate CA → User cert; chain validated end-to-end |
-| Advanced | SSO / Kerberos-like ticketing | Password entered once at Auth Server; signed Session Ticket used for all File Server requests |
-| Advanced | Audit log | Persistent structured log on File Server covering auth, file, group, PKI, and security events |
+| `username` | TEXT (PK) | Tên đăng nhập |
+| `password_hash` | TEXT | Hash mật khẩu (Werkzeug PBKDF2) |
+| `cert_pem` | TEXT | Chuỗi chứng chỉ X.509 đầy đủ (PEM) |
+
+### Bảng `nonces` (cả Auth Server và File Server)
+
+| Cột | Kiểu | Mô tả |
+|---|---|---|
+| `nonce` | TEXT (PK) | Chuỗi nonce hex 128-bit |
+| `timestamp` | TIMESTAMP | Thời điểm request (dùng để TTL cleanup) |
+
+### Bảng `files` (File Server quản lý)
+
+| Cột | Kiểu | Mô tả |
+|---|---|---|
+| `file_id` | TEXT (PK) | UUID duy nhất của tệp |
+| `filename` | TEXT | Tên tệp gốc |
+| `owner` | TEXT | Username người gửi |
+| `target_group` | TEXT | Username người nhận (tệp cá nhân) |
+| `group_name` | TEXT | Tên nhóm (tệp nhóm; NULL nếu là tệp cá nhân) |
+| `wrapped_fsk` | TEXT | FSK đã bọc (hex): RSA-OAEP (cá nhân) hoặc AES-GCM (nhóm) |
+| `upload_time` | TIMESTAMP | Thời điểm tải lên |
+
+### Bảng `groups`
+
+| Cột | Kiểu | Mô tả |
+|---|---|---|
+| `group_name` | TEXT (PK) | Tên nhóm (duy nhất) |
+| `admin` | TEXT | Username Admin hiện tại |
+| `created_at` | TIMESTAMP | Thời điểm tạo nhóm |
+
+### Bảng `group_members`
+
+| Cột | Kiểu | Mô tả |
+|---|---|---|
+| `group_name` | TEXT (PK) | Tên nhóm |
+| `username` | TEXT (PK) | Username thành viên |
+| `display_name` | TEXT | Tên hiển thị trong nhóm |
+| `wrapped_gmk` | TEXT | GMK đã bọc bằng RSA-OAEP với Public Key của thành viên (hex) |
+| `status` | TEXT | `'active'` (đang tham gia) hoặc `'pending'` (chờ chấp nhận lời mời) |
 
 ---
 
-## 10. Project Structure
+## 5. Hướng dẫn cài đặt & chạy
+
+### Yêu cầu hệ thống
+
+- **Docker** và **Docker Compose** (phiên bản ≥ 3.8)
+- **Python 3.9+** (cho Client)
+- Các port `5001`, `5002`, `5003`, `5432` chưa bị chiếm dụng trên máy host
+
+### Bước 1 — Khởi động các Server
+
+```bash
+# Giải nén và vào thư mục dự án
+cd MHUD_CK_File_Sharing
+
+# Build image và khởi động 4 container
+docker-compose up --build
+```
+
+Lần đầu chạy, CA Server sẽ tự động khởi tạo toàn bộ cấu trúc PKI và in:
 
 ```
-project/
-├── docker-compose.yml
-├── ca_server/          # Node 1: CA Server (PKI)
-│   ├── Dockerfile
-│   ├── ca_server.py
-│   ├── root_ca/        # Root CA key and cert (generated at first boot)
-│   └── intermediate_ca/ # Intermediate CA key and cert
-├── auth_server/        # Node 2: Auth Server (KDC)
-│   ├── Dockerfile
-│   ├── auth_server.py
-│   └── nonce_store.db  # Persistent SQLite nonce store
-├── file_server/        # Node 3: File Server (Resource)
-│   ├── Dockerfile
-│   ├── file_server.py
-│   ├── audit_log.txt
-│   ├── nonce_store.db  # Separate persistent nonce store
-│   └── storage/        # Encrypted file blobs and wrapped keys
-└── client/             # Terminal client app
-    ├── client.py
-    ├── local_keystore/  # Encrypted GMK blobs (KEK-encrypted, stored locally)
-    └── certs/           # Cached server certs and CRL
+[CA SERVER] Lần đầu khởi động hệ thống: Tiến hành tạo Root CA và Intermediate CA...
+[CA SERVER] Hệ thống PKI đã thiết lập thành công.
+[AUTH SERVER] Đang tiến hành tạo cặp khóa RSA ký Session Ticket tại thư mục gốc...
 ```
+
+> **Lưu ý:** Nếu `auth_server` khởi động trước khi `postgres_db` sẵn sàng và báo lỗi kết nối database, hãy chạy:
+> ```bash
+> docker-compose restart auth_server
+> ```
+> Kiểm tra lại: `docker-compose ps` — 4 container đều phải ở trạng thái `Up`.
+
+### Bước 2 — Cài đặt và chạy Client
+
+```bash
+# Mở terminal mới (giữ nguyên terminal server đang chạy)
+cd MHUD_CK_File_Sharing/client
+
+# Cài đặt thư viện Python
+pip install -r ../requirements.txt
+
+# Khởi động ứng dụng
+python client.py
+```
+
+### Bước 3 — Sử dụng lần đầu
+
+Màn hình chào hiện ra khi chưa đăng nhập:
+
+```
+======================================
+       HỆ THỐNG CHIA SẺ TỆP AN TOÀN
+======================================
+[Trạng thái]: Chưa đăng nhập hệ thống
+1. Đăng nhập hệ thống
+2. Đăng ký tài khoản định danh PKI
+0. Thoát chương trình
+```
+
+Chọn `2` để đăng ký. Hệ thống tự động sinh RSA-2048, gửi CSR đến CA và lưu chứng chỉ về máy.
+
+---
+
+## 6. Luồng hoạt động của ứng dụng
+
+### 6.1 Đăng ký tài khoản
+
+```
+Client: Nhập username + password
+     → Sinh cặp khóa RSA-2048 cục bộ + tạo CSR
+     → Gửi {username, password, CSR} đến Auth Server /register
+          Auth Server: Kiểm tra username trùng
+                     → Chuyển CSR đến CA Server /issue_cert
+               CA Server: Ký CSR bằng Intermediate CA → trả về cert_chain (PEM 3 tầng)
+          Auth Server: Lưu {username, hash(password), cert_chain} vào DB
+     → Client nhận cert_chain
+     → Lưu private key  → client_data/<username>/<username>_priv.pem
+     → Lưu cert chain   → client_data/<username>/<username>_cert.pem
+     → In: "[+] Đăng ký thành công!"
+```
+
+### 6.2 Đăng nhập
+
+```
+Client: Nhập username + password
+     → Sinh Nonce (128-bit hex) + Timestamp (ISO 8601 UTC)
+     → Gửi {username, password, nonce, timestamp} đến Auth Server /login
+          Auth Server: Kiểm tra Nonce + Timestamp (chống Replay Attack)
+                     → Xác minh hash(password)
+                     → Tải CRL từ CA Server, kiểm tra serial_number chứng chỉ
+                     → Ký JWT RS256: payload {username, iat, exp=iat+2h}
+     → Client nhận Session Ticket (JWT), lưu trong RAM
+```
+
+### 6.3 Menu chính (sau đăng nhập)
+
+```
+======================================
+       HỆ THỐNG CHIA SẺ TỆP AN TOÀN
+======================================
+[Trạng thái]: Đã đăng nhập làm vế: 'username'
+1. Tệp đang chờ xử lý (Pending Files) (N)
+2. Chia sẻ tệp cho cá nhân (Upload Individual)
+3. Chia sẻ tệp lên nhóm (Upload Group)
+4. Nhóm của tôi (My Groups) (N)
+5. Đăng xuất
+0. Thoát chương trình
+```
+
+Số `(N)` hiển thị số lượng tệp đang chờ / số nhóm đang tham gia.
+
+### 6.4 Tệp đang chờ xử lý (Pending Files)
+
+Hiển thị bảng các tệp được chia sẻ đến bạn:
+
+```
+STT  | Tên tệp tin                    | Người gửi       | Nhóm            | Thời gian
+-------------------------------------------------------------------------------------------------
+1    | baocao.pdf                     | alice           | Nhom_KMA        | 2026-05-20 10:05:12
+```
+
+Sau khi chọn tệp, hệ thống hỏi `[Y/N/C]` (Tải xuống / Xóa / Quay lại):
+
+- **Y**: Tải blob mã hóa → giải mã tự động → lưu file rõ tại `client_data/<username>/decrypted_<filename>`. Tệp cá nhân tự xóa khỏi Server sau khi tải thành công; tệp nhóm vẫn giữ trên Server cho thành viên khác.
+- **N**: Xóa tệp khỏi hàng đợi không tải (người gửi hoặc Admin nhóm mới được xóa tệp nhóm; người gửi hoặc người nhận được xóa tệp cá nhân).
+
+### 6.5 Chia sẻ tệp cho cá nhân
+
+```
+→ Nhập đường dẫn tệp nguồn trên máy cục bộ
+→ Nhập Username người nhận
+→ Truy xuất chứng chỉ X.509 người nhận từ Auth Server /registry/<username>
+→ Trích xuất Public Key RSA của người nhận
+→ Sinh FSK ngẫu nhiên → mã hóa tệp (AES-256-GCM)
+→ Bọc FSK bằng RSA-OAEP với Public Key người nhận
+→ Upload encrypted_blob + wrapped_fsk lên File Server
+```
+
+### 6.6 Chia sẻ tệp lên nhóm
+
+```
+→ Hiển thị danh sách nhóm đang tham gia, chọn nhóm đích
+→ Nhập đường dẫn tệp nguồn
+→ Tải wrapped_gmk của bản thân từ File Server
+→ Giải mã GMK bằng Private Key RSA cục bộ (RSA-OAEP)
+→ Sinh FSK ngẫu nhiên → mã hóa tệp (AES-256-GCM)
+→ Bọc FSK bằng GMK (AES-256-GCM, IV 12 bytes)
+→ Upload encrypted_blob + wrapped_fsk + group_name lên File Server
+```
+
+### 6.7 Quản lý nhóm
+
+**Menu nhóm chính:**
+
+```
+1. Xem danh sách nhóm của tôi
+2. Lời mời vào nhóm (N)
+3. Tạo nhóm mới
+0. Quay lại Menu chính
+```
+
+**Menu chi tiết nhóm:**
+
+```
+--- QUẢN TRỊ NHÓM: <tên_nhóm> ---
+1. Xem danh sách thành viên
+2. Thêm thành viên            [Chỉ Admin]
+3. Xóa thành viên             [Chỉ Admin]
+4. Đổi tên hiển thị của tôi
+5. Đổi tên nhóm               [Chỉ Admin]
+6. Chuyển quyền Admin         [Chỉ Admin]
+7. Rời nhóm
+8. Xóa nhóm                   [Chỉ Admin]
+0. Quay lại
+```
+
+Kiểm tra quyền được thực hiện **cả ở Client (UI) và Server (endpoint)**. Nếu thành viên thường cố gọi action Admin, Client in:
+```
+[-] TỪ CHỐI TRUY CẬP: Chỉ Quản trị viên (Admin) mới có quyền thực hiện hành động này.
+```
+Server cũng trả về `403 Access Denied` độc lập với Client.
+
+**Luồng thêm thành viên (Admin):**
+
+```
+Admin nhập username người mới
+→ Tải chứng chỉ X.509 người mới từ Auth Server /registry/<username>
+→ Trích xuất Public Key RSA của người mới
+→ Tải wrapped_gmk của bản thân từ File Server
+→ Giải mã GMK bằng Private Key RSA cục bộ
+→ Mã hóa GMK bằng RSA-OAEP với Public Key người mới → wrapped_gmk_mới
+→ Gửi lên File Server (action: "invite") kèm wrapped_gmk_mới
+→ Người mới thấy lời mời ở mục "Lời mời vào nhóm" (status: 'pending')
+```
+
+**Luồng chấp nhận lời mời:**
+
+```
+Thành viên mới vào mục "Lời mời vào nhóm"
+→ Chọn nhóm → xác nhận Y
+→ Nhập tên hiển thị trong nhóm
+→ Tải wrapped_gmk từ Server → giải mã bằng Private Key cục bộ → GMK vào RAM
+→ Gửi action "accept_invite" + display_name lên File Server (status: 'active')
+```
+
+**Xử lý rời nhóm:**
+
+- Admin cố rời khi còn thành viên khác → Server trả về: `You are the admin. Transfer admin rights before leaving. Use option 6.`
+- Admin là thành viên duy nhất → rời sẽ tự động xóa nhóm
+
+### 6.8 Audit Log
+
+Tất cả giao dịch được ghi vào `file_server/logs/audit_log.txt`:
+
+```
+[2026-05-20T10:00:00.000000] [GROUP] User 'alice' created group 'Nhom_KMA'.
+[2026-05-20T10:05:12.000000] [FILE] User 'alice' uploaded file 'baocao.pdf' to target 'Nhom_KMA'.
+[2026-05-20T10:10:00.000000] [FILE_DOWNLOAD] User 'bob' requested encrypted blob for file_id 'a1b2...'.
+[2026-05-20T10:15:00.000000] [FILE_PURGE] Tệp tin 'a1b2...' đã bị xóa khỏi hệ thống bởi 'bob'.
+```
+
+---
+
+## 7. Cấu trúc thư mục dự án
+
+```
+MHUD_CK_File_Sharing/
+│
+├── docker-compose.yml          # Khai báo 4 container: postgres_db, ca_server, auth_server, file_server
+├── requirements.txt            # Flask, cryptography, PyJWT, psycopg2, pandas, openpyxl
+├── clean.py                    # Công cụ reset toàn bộ hệ thống về trạng thái sạch ban đầu
+├── export_db.py                # Công cụ xuất toàn bộ database PostgreSQL ra file Excel
+│
+├── ca_server/
+│   ├── Dockerfile
+│   ├── ca_server.py            # Flask app: /issue_cert, /crl
+│   ├── root_ca/                # root_key.pem, root_cert.pem (tự động sinh lần đầu boot)
+│   └── intermediate_ca/        # int_key.pem, int_cert.pem, crl.pem (tự động sinh lần đầu boot)
+│
+├── auth_server/
+│   ├── Dockerfile
+│   ├── auth_server.py          # Flask app: /register, /login, /public_key, /registry/<username>
+│   ├── auth_priv_key.pem       # Private Key RSA-2048 ký JWT Session Ticket (tự động sinh)
+│   ├── auth_pub_key.pem        # Public Key tương ứng (chia sẻ với File Server)
+│   └── nonce_store.db          # File chốt volume Docker (dữ liệu nonce lưu trong PostgreSQL)
+│
+├── file_server/
+│   ├── Dockerfile
+│   ├── file_server.py          # Flask app: upload, download, delete, group management
+│   ├── storage/                # Blob mã hóa (đặt tên theo file_id UUID)
+│   ├── logs/
+│   │   └── audit_log.txt       # Nhật ký kiểm toán toàn hệ thống
+│   └── database/               # Thư mục dự phòng (dữ liệu thực lưu trong PostgreSQL)
+│
+└── client/
+    ├── client.py               # Ứng dụng terminal Python đầy đủ tính năng
+    └── client_data/
+        └── <username>/         # Thư mục cô lập cho từng người dùng
+            ├── <username>_priv.pem     # Private Key RSA-2048 (không bao giờ rời khỏi máy)
+            └── <username>_cert.pem     # Chuỗi chứng chỉ X.509 (User → Intermediate → Root)
+```
+
+---
+
+## 8. Công cụ tiện ích
+
+### `clean.py` — Reset hệ thống
+
+Đưa toàn bộ hệ thống về trạng thái sạch hoàn toàn: xóa tất cả khóa CA, chứng chỉ, tệp mã hóa, log, và dữ liệu client.
+
+```bash
+python clean.py
+```
+
+Kịch bản thực hiện theo thứ tự:
+
+1. `docker-compose down` — hạ toàn bộ container và giải phóng quyền đọc/ghi file
+2. Xóa nội dung `ca_server/root_ca/` và `ca_server/intermediate_ca/`
+3. Tái tạo file trống `auth_server/auth_priv_key.pem` và `auth_server/auth_pub_key.pem`
+4. Xóa nội dung `file_server/storage/`, `file_server/logs/`, `file_server/database/`
+5. Xóa nội dung `client/client_data/`
+
+Sau khi reset, chạy lại `docker-compose up --build` để hệ thống tự khởi tạo PKI mới.
+
+### `export_db.py` — Xuất database ra Excel
+
+Xuất toàn bộ nội dung các bảng trong PostgreSQL ra file `database_export.xlsx` (mỗi bảng một Sheet). Dữ liệu nhị phân như khóa mã hóa được tự động chuyển thành chuỗi HEX cho dễ đọc.
+
+```bash
+# Yêu cầu: container postgres_db đang chạy (docker-compose up)
+python export_db.py
+```
+
+---
+
+## 9. Bảng tổng hợp yêu cầu đã đạt
+
+| Mức | Yêu cầu | Hiện thực trong mã nguồn |
+|---|---|---|
+| **Cơ bản** | Mã hóa lai ghép AES + RSA | FSK (AES-256-GCM) mã hóa nội dung tệp; RSA-OAEP bọc FSK (cá nhân) hoặc AES-GCM bọc FSK (nhóm) |
+| **Cơ bản** | Vòng đời khóa (tạo, phân phối) | GMK sinh ngẫu nhiên khi tạo nhóm; bọc RSA-OAEP riêng cho từng thành viên; Admin thực hiện xoay vòng thủ công khi xóa thành viên |
+| **Cơ bản** | Chống Replay Attack (Nonce + Timestamp) | Mọi request gắn `X-Nonce` (128-bit hex) + `X-Timestamp` (ISO 8601); server kiểm tra TTL 5 phút và bảng `nonces` PostgreSQL bền vững |
+| **Cơ bản** | Xác thực nguồn gốc khóa công khai | Khóa công khai phân phối qua chứng chỉ X.509 từ hệ thống PKI; Auth Server đóng vai trò Public Key Registry |
+| **Tốt** | Tách biệt Master Key và Session Key | GMK là Master Key tồn tại xuyên suốt vòng đời nhóm; FSK là Session Key per-file; FSK luôn được bọc dưới GMK |
+| **Tốt** | Kiểm soát truy cập theo danh tính | Admin-only (thêm/xóa thành viên, đổi tên nhóm, chuyển quyền, xóa nhóm) được kiểm tra độc lập ở cả Client lẫn Server |
+| **Tốt** | X.509, CRL, bảo vệ MITM | Chuỗi chứng chỉ hai tầng (Root → Intermediate → User); CRL kiểm tra tại mỗi lần đăng nhập; Public Key phân phối qua Auth Server Registry |
+| **Nâng cao** | 3+ Docker container | 4 container: `ca_server` (PKI), `auth_server` (KDC/SSO), `file_server` (Resource), `postgres_db` (Database) |
+| **Nâng cao** | PKI với chuỗi chứng chỉ | Root CA (RSA-4096, tự ký) → Intermediate CA (RSA-4096) → User Cert (RSA-2048, hiệu lực 1 năm) |
+| **Nâng cao** | SSO / Kerberos-like Ticketing | Mật khẩu nhập một lần tại Auth Server; JWT RS256 (hiệu lực 2 giờ) dùng cho mọi request đến File Server; File Server không cần liên hệ Auth Server |
+| **Nâng cao** | Audit Log | `./logs/audit_log.txt` ghi đầy đủ sự kiện: `FILE` (upload), `FILE_DOWNLOAD`, `FILE_PURGE`, `GROUP` (tạo nhóm) |
