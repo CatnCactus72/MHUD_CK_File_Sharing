@@ -542,7 +542,7 @@ def group_detail_menu(group_name, admin_username):
                 # Bổ sung kiểm tra kết quả từ Server
                 if resp.status_code == 200:
                     print("[+] Thành viên đã bị xóa.")
-                    print("[!] BẢO MẬT: Giao thức Xoay vòng khóa (Key Rotation - Mục 4.4) đã được kích hoạt. Hãy tạo GMK mới để chặn Forward Secrecy!")
+                    print("[!] BẢO MẬT: Giao thức Xoay vòng khóa (Key Rotation) đã được kích hoạt. Hãy tạo GMK mới để chặn Forward Secrecy!")
                     break # Quay lại danh sách
                 else:
                     print("[-] Lỗi:", resp.json().get("error"))

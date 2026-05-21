@@ -1,6 +1,21 @@
 version: '3.8'
 
 services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: doan_user
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: secure_file_sharing
+    ports:
+      - "5432:5432" # Ánh xạ port để bạn có thể dùng PgAdmin kết nối từ máy host
+    volumes:
+      - pgdata:/var/lib/postgresql/data # Lưu trữ dữ liệu DB bền vững
+    networks:
+      - secure_net
+
   ca_server:
     build:
       context: .
@@ -21,13 +36,19 @@ services:
     container_name: auth_server
     ports:
       - "5002:5002"
-    # Ánh xạ trực tiếp từng tệp tin phẳng để lưu trữ lâu dài trên máy host
+    # 2. CẬP NHẬT: Thêm biến môi trường kết nối DB
+    environment:
+      - DB_HOST=postgres_db
+      - DB_PORT=5432
+      - DB_NAME=secure_file_sharing
+      - DB_USER=doan_user
+      - DB_PASS=123456
     volumes:
-      - ./auth_server/nonce_store.db:/app/nonce_store.db
       - ./auth_server/auth_priv_key.pem:/app/auth_priv_key.pem
       - ./auth_server/auth_pub_key.pem:/app/auth_pub_key.pem
     depends_on:
       - ca_server
+      - postgres_db # 3. Đảm bảo DB khởi động trước
     networks:
       - secure_net
 
@@ -38,14 +59,26 @@ services:
     container_name: file_server
     ports:
       - "5003:5003"
+    # 4. CẬP NHẬT: Thêm biến môi trường kết nối DB
+    environment:
+      - DB_HOST=postgres_db
+      - DB_PORT=5432
+      - DB_NAME=secure_file_sharing
+      - DB_USER=doan_user
+      - DB_PASS=123456
     volumes:
-      - ./file_server/database:/app/database
+      # BỎ ánh xạ file database vì đã dùng PostgreSQL
       - ./file_server/storage:/app/storage
       - ./file_server/logs:/app/logs
     depends_on:
       - auth_server
+      - postgres_db # 5. Đảm bảo DB khởi động trước
     networks:
       - secure_net
+
+# Khai báo volume dùng chung cho PostgreSQL
+volumes:
+  pgdata:
 
 networks:
   secure_net:

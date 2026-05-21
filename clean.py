@@ -64,8 +64,6 @@ def main():
 
     print("\n======================================================================")
     print("[+] THÀNH CÔNG: Toàn bộ hệ thống đã được đưa về trạng thái nguyên bản!")
-    print("[*] Bây giờ bạn có thể tái tạo dữ liệu và chạy lại hệ thống bằng lệnh:")
-    print("    docker-compose up --build -d")
     print("======================================================================")
 
 if __name__ == "__main__":

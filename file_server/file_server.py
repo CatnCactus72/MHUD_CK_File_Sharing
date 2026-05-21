@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import psycopg2
 import datetime
 import jwt
 import requests
@@ -10,7 +10,7 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 
 # Cấu hình thư mục
-DB_PATH = "./database/file_server.db"
+# DB_PATH = "./database/file_server.db"
 STORAGE_DIR = "./storage"
 LOG_PATH = "./logs/audit_log.txt"
 
@@ -20,36 +20,41 @@ NONCE_TTL_MINUTES = 5
 
 AUTH_PUBLIC_KEY = None
 
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "127.0.0.1"),
+        port=os.getenv("DB_PORT", "5432"),
+        database=os.getenv("DB_NAME", "secure_file_sharing"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASS", "123456")
+    )
+
 def init_system():
     """Khởi tạo database, thư mục lưu trữ và file log"""
-    os.makedirs("./database", exist_ok=True)
+    # os.makedirs("./database", exist_ok=True)
     os.makedirs(STORAGE_DIR, exist_ok=True)
     os.makedirs("./logs", exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    # Bảng lưu Nonce chống Replay Attack
-    cursor.execute('''CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, timestamp DATETIME NOT NULL)''')
-    # Bảng Public Key Registry (lưu chứng chỉ của user)
-    cursor.execute('''CREATE TABLE IF NOT EXISTS public_keys (username TEXT PRIMARY KEY, cert_pem TEXT NOT NULL)''')
-    # Bảng siêu dữ liệu tệp tin
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, timestamp TIMESTAMP NOT NULL)''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS files (
             file_id TEXT PRIMARY KEY,
             filename TEXT,
             owner TEXT,
-            target_group TEXT, -- Tên người nhận (nếu gửi cá nhân)
-            group_name TEXT,   -- Tên nhóm (nếu gửi nhóm, ngược lại để NULL)
-            wrapped_fsk TEXT,  -- Khóa FSK đã mã hóa bọc
-            upload_time DATETIME
+            target_group TEXT,
+            group_name TEXT,
+            wrapped_fsk TEXT,
+            upload_time TIMESTAMP -- SỬA Ở ĐÂY
         )
     ''')
-    # Bảng metadata nhóm
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             group_name TEXT PRIMARY KEY,
             admin TEXT,
-            created_at DATETIME
+            created_at TIMESTAMP -- SỬA Ở ĐÂY
         )
     ''')
     cursor.execute('''
@@ -91,10 +96,10 @@ def get_auth_public_key():
     return AUTH_PUBLIC_KEY
 
 def cleanup_old_nonces():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     expiration_time = datetime.datetime.utcnow() - datetime.timedelta(minutes=NONCE_TTL_MINUTES)
-    cursor.execute("DELETE FROM nonces WHERE timestamp < ?", (expiration_time,))
+    cursor.execute("DELETE FROM nonces WHERE timestamp < %s", (expiration_time,))
     conn.commit()
     conn.close()
 
@@ -126,14 +131,14 @@ def require_auth(f):
             return jsonify({"error": "403 Request timestamp out of window."}), 403
 
         cleanup_old_nonces()
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT nonce FROM nonces WHERE nonce = ?", (nonce,))
+        cursor.execute("SELECT nonce FROM nonces WHERE nonce = %s", (nonce,))
         if cursor.fetchone():
             conn.close()
             return jsonify({"error": "403 Replay Attack Detected: Nonce already used!"}), 403
         
-        cursor.execute("INSERT INTO nonces (nonce, timestamp) VALUES (?, ?)", (nonce, req_time))
+        cursor.execute("INSERT INTO nonces (nonce, timestamp) VALUES (%s, %s)", (nonce, req_time))
         conn.commit()
         conn.close()
 
@@ -177,11 +182,11 @@ def upload_file():
     save_path = os.path.join(STORAGE_DIR, file_id)
     file.save(save_path)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     # Thêm group_name vào bản ghi tệp tin
     cursor.execute(
-        "INSERT INTO files (file_id, filename, owner, target_group, group_name, wrapped_fsk, upload_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO files (file_id, filename, owner, target_group, group_name, wrapped_fsk, upload_time) VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (file_id, filename, request.user, target_group, group_name, wrapped_fsk, datetime.datetime.utcnow())
     )
     conn.commit()
@@ -195,7 +200,7 @@ def upload_file():
 @require_auth
 def get_my_groups():
     """Lấy danh sách nhóm (active) và lời mời (pending)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Nhóm đang tham gia (Active)
@@ -204,7 +209,7 @@ def get_my_groups():
                (SELECT COUNT(*) FROM group_members WHERE group_name = g.group_name AND status = 'active') as member_count
         FROM groups g
         JOIN group_members m ON g.group_name = m.group_name
-        WHERE m.username = ? AND m.status = 'active'
+        WHERE m.username = %s AND m.status = 'active'
     ''', (request.user,))
     active_groups = [{"group_name": r[0], "admin": r[1], "created_at": r[2], "member_count": r[3]} for r in cursor.fetchall()]
     
@@ -213,7 +218,7 @@ def get_my_groups():
         SELECT g.group_name, g.admin, m.wrapped_gmk
         FROM groups g
         JOIN group_members m ON g.group_name = m.group_name
-        WHERE m.username = ? AND m.status = 'pending'
+        WHERE m.username = %s AND m.status = 'pending'
     ''', (request.user,))
     invitations = [{"group_name": r[0], "admin": r[1], "wrapped_gmk": r[2]} for r in cursor.fetchall()]
     
@@ -227,18 +232,18 @@ def create_group():
     group_name = data.get('group_name')
     wrapped_gmk = data.get('wrapped_gmk')
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         created_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute("INSERT INTO groups (group_name, admin, created_at) VALUES (?, ?, ?)", 
+        cursor.execute("INSERT INTO groups (group_name, admin, created_at) VALUES (%s, %s, %s)", 
                        (group_name, request.user, created_at))
-        cursor.execute("INSERT INTO group_members (group_name, username, display_name, wrapped_gmk, status) VALUES (?, ?, ?, ?, 'active')", 
+        cursor.execute("INSERT INTO group_members (group_name, username, display_name, wrapped_gmk, status) VALUES (%s, %s, %s, %s, 'active')", 
                        (group_name, request.user, request.user, wrapped_gmk))
         conn.commit()
         write_audit_log("GROUP", f"User '{request.user}' created group '{group_name}'.")
         return jsonify({"message": "Success"}), 200
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return jsonify({"error": "Tên nhóm đã tồn tại."}), 409
     finally:
         conn.close()
@@ -246,9 +251,9 @@ def create_group():
 @app.route('/group/<group_name>/members', methods=['GET'])
 @require_auth
 def get_group_members(group_name):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT username, display_name FROM group_members WHERE group_name = ? AND status = 'active'", (group_name,))
+    cursor.execute("SELECT username, display_name FROM group_members WHERE group_name = %s AND status = 'active'", (group_name,))
     members = [{"username": r[0], "display_name": r[1] or r[0]} for r in cursor.fetchall()]
     conn.close()
     return jsonify({"members": members}), 200
@@ -260,9 +265,9 @@ def group_action(group_name):
     data = request.json
     action = data.get('action')
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT admin FROM groups WHERE group_name = ?", (group_name,))
+    cursor.execute("SELECT admin FROM groups WHERE group_name = %s", (group_name,))
     group_row = cursor.fetchone()
     if not group_row:
         return jsonify({"error": "Group not found"}), 404
@@ -274,62 +279,62 @@ def group_action(group_name):
         if action == "invite":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
             target, wrapped_gmk = data.get('target_user'), data.get('wrapped_gmk')
-            cursor.execute("INSERT INTO group_members (group_name, username, wrapped_gmk, status) VALUES (?, ?, ?, 'pending')", 
+            cursor.execute("INSERT INTO group_members (group_name, username, wrapped_gmk, status) VALUES (%s, %s, %s, 'pending')", 
                            (group_name, target, wrapped_gmk))
             
         elif action == "accept_invite":
             display_name = data.get('display_name')
-            cursor.execute("UPDATE group_members SET status = 'active', display_name = ? WHERE group_name = ? AND username = ?", 
+            cursor.execute("UPDATE group_members SET status = 'active', display_name = %s WHERE group_name = %s AND username = %s", 
                            (display_name, group_name, request.user))
                            
         elif action == "decline_invite":
-            cursor.execute("DELETE FROM group_members WHERE group_name = ? AND username = ? AND status = 'pending'", (group_name, request.user))
+            cursor.execute("DELETE FROM group_members WHERE group_name = %s AND username = %s AND status = 'pending'", (group_name, request.user))
             
         elif action == "remove":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
             target_user = data.get('target_user')
             
             # Kiểm tra xem người dùng có tồn tại trong nhóm không
-            cursor.execute("SELECT 1 FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
+            cursor.execute("SELECT 1 FROM group_members WHERE group_name = %s AND username = %s", (group_name, target_user))
             if not cursor.fetchone():
                 return jsonify({"error": f"Thành viên '{target_user}' không tồn tại trong nhóm."}), 404
                 
-            cursor.execute("DELETE FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
+            cursor.execute("DELETE FROM group_members WHERE group_name = %s AND username = %s", (group_name, target_user))
             
         elif action == "edit_display_name":
-            cursor.execute("UPDATE group_members SET display_name = ? WHERE group_name = ? AND username = ?", 
+            cursor.execute("UPDATE group_members SET display_name = %s WHERE group_name = %s AND username = %s", 
                            (data.get('new_name'), group_name, request.user))
                            
         elif action == "edit_group_name":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
             new_name = data.get('new_name')
-            cursor.execute("UPDATE groups SET group_name = ? WHERE group_name = ?", (new_name, group_name))
-            cursor.execute("UPDATE group_members SET group_name = ? WHERE group_name = ?", (new_name, group_name))
+            cursor.execute("UPDATE groups SET group_name = %s WHERE group_name = %s", (new_name, group_name))
+            cursor.execute("UPDATE group_members SET group_name = %s WHERE group_name = %s", (new_name, group_name))
             
         elif action == "transfer_admin":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
             target_user = data.get('target_user')
             
             # Kiểm tra xem người dùng có tồn tại trong nhóm không
-            cursor.execute("SELECT 1 FROM group_members WHERE group_name = ? AND username = ?", (group_name, target_user))
+            cursor.execute("SELECT 1 FROM group_members WHERE group_name = %s AND username = %s", (group_name, target_user))
             if not cursor.fetchone():
                 return jsonify({"error": f"Thành viên '{target_user}' không tồn tại trong nhóm."}), 404
                 
-            cursor.execute("UPDATE groups SET admin = ? WHERE group_name = ?", (target_user, group_name))
+            cursor.execute("UPDATE groups SET admin = %s WHERE group_name = %s", (target_user, group_name))
 
         elif action == "leave":
-            cursor.execute("SELECT COUNT(*) FROM group_members WHERE group_name = ? AND status = 'active'", (group_name,))
+            cursor.execute("SELECT COUNT(*) FROM group_members WHERE group_name = %s AND status = 'active'", (group_name,))
             count = cursor.fetchone()[0]
             if is_admin and count > 1:
                 return jsonify({"error": "You are the admin. Transfer admin rights before leaving. Use option 6."}), 400
-            cursor.execute("DELETE FROM group_members WHERE group_name = ? AND username = ?", (group_name, request.user))
+            cursor.execute("DELETE FROM group_members WHERE group_name = %s AND username = %s", (group_name, request.user))
             if count == 1: # Xóa nhóm nếu là người cuối cùng
-                cursor.execute("DELETE FROM groups WHERE group_name = ?", (group_name,))
+                cursor.execute("DELETE FROM groups WHERE group_name = %s", (group_name,))
                 
         elif action == "delete":
             if not is_admin: return jsonify({"error": "Access Denied"}), 403
-            cursor.execute("DELETE FROM groups WHERE group_name = ?", (group_name,))
-            cursor.execute("DELETE FROM group_members WHERE group_name = ?", (group_name,))
+            cursor.execute("DELETE FROM groups WHERE group_name = %s", (group_name,))
+            cursor.execute("DELETE FROM group_members WHERE group_name = %s", (group_name,))
             
         conn.commit()
         return jsonify({"message": "Action completed"}), 200
@@ -342,18 +347,18 @@ def group_action(group_name):
 @require_auth
 def get_group_details(group_name):
     """API phục vụ trích xuất gói khóa GMK và thông tin thành viên (Bị thiếu ở bản trước)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # 1. Lấy thông tin Admin
-    cursor.execute("SELECT admin FROM groups WHERE group_name = ?", (group_name,))
+    cursor.execute("SELECT admin FROM groups WHERE group_name = %s", (group_name,))
     group_info = cursor.fetchone()
     if not group_info:
         conn.close()
         return jsonify({"error": "Không tìm thấy nhóm"}), 404
         
     # 2. Lấy danh sách thành viên (Active) kèm theo bản bọc khóa GMK của họ
-    cursor.execute("SELECT username, wrapped_gmk FROM group_members WHERE group_name = ? AND status = 'active'", (group_name,))
+    cursor.execute("SELECT username, wrapped_gmk FROM group_members WHERE group_name = %s AND status = 'active'", (group_name,))
     members = [{"username": r[0], "wrapped_gmk": r[1]} for r in cursor.fetchall()]
     conn.close()
     
@@ -371,14 +376,14 @@ def get_group_details(group_name):
 @require_auth
 def get_pending_files():
     """Lấy danh sách tệp tin chờ xử lý (Hỗ trợ phân tách cá nhân và nhóm)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
         SELECT file_id, filename, owner, target_group, group_name, wrapped_fsk, upload_time 
         FROM files 
-        WHERE target_group = ? 
-           OR (group_name IS NOT NULL AND group_name IN (SELECT group_name FROM group_members WHERE username = ? AND status = 'active'))
+        WHERE target_group = %s 
+           OR (group_name IS NOT NULL AND group_name IN (SELECT group_name FROM group_members WHERE username = %s AND status = 'active'))
     ''', (request.user, request.user))
     
     rows = cursor.fetchall()
@@ -408,11 +413,11 @@ def download_file_blob(file_id):
 @require_auth
 def delete_file(file_id):
     """Xóa file khỏi cơ sở dữ liệu và ổ đĩa sau khi client tải và giải mã thành công"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Lấy thông tin chủ sở hữu, người nhận cá nhân và tên nhóm của tệp
-    cursor.execute("SELECT owner, target_group, group_name FROM files WHERE file_id = ?", (file_id,))
+    cursor.execute("SELECT owner, target_group, group_name FROM files WHERE file_id = %s", (file_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -424,7 +429,7 @@ def delete_file(file_id):
     
     if group_name:
         # Nếu là FILE NHÓM: Truy xuất quyền Admin của nhóm
-        cursor.execute("SELECT admin FROM groups WHERE group_name = ?", (group_name,))
+        cursor.execute("SELECT admin FROM groups WHERE group_name = %s", (group_name,))
         admin_row = cursor.fetchone()
         group_admin = admin_row[0] if admin_row else None
         
@@ -441,7 +446,7 @@ def delete_file(file_id):
         return jsonify({"error": "Từ chối truy cập. Chỉ người gửi hoặc Quản trị viên nhóm mới được phép xóa tệp này."}), 403
 
     # Tiến hành xóa trong Database
-    cursor.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
+    cursor.execute("DELETE FROM files WHERE file_id = %s", (file_id,))
     conn.commit()
     conn.close()
 

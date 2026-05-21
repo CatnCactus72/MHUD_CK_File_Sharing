@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import psycopg2
 import datetime
 import requests
 import jwt
@@ -8,6 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+import time 
 
 app = Flask(__name__)
 
@@ -19,10 +20,25 @@ AUTH_PUB_KEY_PATH = "./auth_pub_key.pem"
 CA_SERVER_URL = "http://ca_server:5001"
 NONCE_TTL_MINUTES = 5
 
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "127.0.0.1"),
+        port=os.getenv("DB_PORT", "5432"),
+        database=os.getenv("DB_NAME", "secure_file_sharing"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASS", "123456")
+    )
+
 def init_system():
     """Khởi tạo database nonce_store.db và cặp khóa RSA trực tiếp tại thư mục gốc."""
     # Khởi tạo Database (Bao gồm bảng Users và bảng dữ liệu Nonce Store bền vững)
-    conn = sqlite3.connect(DB_PATH)
+    
+    # tránh xung đột với file_server khi tạo container Docker
+    # nếu vẫn lỗi, chạy lệnh sau 
+    # docker-compose restart auth_server
+    # sau đó gõ lệnh docker-compose ps, nếu xuất hiện 4 dòng đều có trạng thái Up là ok
+    time.sleep(5) 
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -34,7 +50,7 @@ def init_system():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS nonces (
             nonce TEXT PRIMARY KEY,
-            timestamp DATETIME NOT NULL
+            timestamp TIMESTAMP NOT NULL 
         )
     ''')
     conn.commit()
@@ -60,10 +76,10 @@ def init_system():
 
 def cleanup_old_nonces():
     """Tự động dọn dẹp các nonce đã vượt quá thời gian TTL quy định"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     expiration_time = datetime.datetime.utcnow() - datetime.timedelta(minutes=NONCE_TTL_MINUTES)
-    cursor.execute("DELETE FROM nonces WHERE timestamp < ?", (expiration_time,))
+    cursor.execute("DELETE FROM nonces WHERE timestamp < %s", (expiration_time,))
     conn.commit()
     conn.close()
 
@@ -83,15 +99,15 @@ def check_replay_attack(nonce, timestamp_str):
     cleanup_old_nonces()
 
     # 2. Thực hiện tra cứu kiểm tra trùng lặp Nonce trong kho lưu trữ bền vững
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT nonce FROM nonces WHERE nonce = ?", (nonce,))
+    cursor.execute("SELECT nonce FROM nonces WHERE nonce = %s", (nonce,))
     if cursor.fetchone() is not None:
         conn.close()
         return False, "403 Replay Attack Detected: Nonce already used!"
     
     # Lưu vết Nonce hợp lệ mới vào hệ thống
-    cursor.execute("INSERT INTO nonces (nonce, timestamp) VALUES (?, ?)", (nonce, req_time))
+    cursor.execute("INSERT INTO nonces (nonce, timestamp) VALUES (%s, %s)", (nonce, req_time))
     conn.commit()
     conn.close()
     return True, "OK"
@@ -104,9 +120,9 @@ def register():
     if not all([username, password, csr]):
         return jsonify({"error": "Thiếu dữ liệu đầu vào"}), 400
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT username FROM users WHERE username = %s", (username,))
     if cursor.fetchone():
         conn.close()
         return jsonify({"error": "Username đã tồn tại"}), 409
@@ -120,7 +136,7 @@ def register():
         return jsonify({"error": f"Lỗi kết nối CA Server: {str(e)}"}), 500
 
     password_hash = generate_password_hash(password)
-    cursor.execute("INSERT INTO users (username, password_hash, cert_pem) VALUES (?, ?, ?)", 
+    cursor.execute("INSERT INTO users (username, password_hash, cert_pem) VALUES (%s, %s, %s)", 
                    (username, password_hash, cert_chain))
     conn.commit()
     conn.close()
@@ -140,9 +156,9 @@ def login():
     if not is_valid:
         return jsonify({"error": msg}), 403
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT password_hash, cert_pem FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT password_hash, cert_pem FROM users WHERE username = %s", (username,))
     row = cursor.fetchone()
     conn.close()
 
@@ -187,10 +203,10 @@ def get_public_key():
 @app.route('/registry/<username>', methods=['GET'])
 def get_user_cert(username):
     """Public Key Registry: Trả về X.509 Certificate của user từ database của Auth Server"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     # Truy vấn trực tiếp từ bảng users
-    cursor.execute("SELECT cert_pem FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT cert_pem FROM users WHERE username = %s", (username,))
     row = cursor.fetchone()
     conn.close()
     
