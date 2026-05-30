@@ -5,6 +5,25 @@
 
 ---
 
+## Hướng dẫn cài đặt và chạy chương trình
+- Sau khi cài đặt và chạy Docker, mở terminal tại thư mục gốc và chạy 2 lệnh sau:
+
+docker-compose build
+docker-compose up -d
+
+- Sau khi các container được chạy thành công, mở terminal khác và chạy lệnh sau để chạy ứng dụng bên phía client:
+
+cd client
+python client.py
+
+- Khi cần xoá hết toàn bộ dữ liệu, về thư mục gốc và chạy lệnh sau:
+
+python clean.py
+
+- Để xuất ra các database có trong hệ thống hiện tại, chạy lệnh sau tại thư mục gốc:
+
+python export_db.py
+
 ## Mục lục
 
 1. [Tổng quan dự án](#1-tổng-quan-dự-án)
