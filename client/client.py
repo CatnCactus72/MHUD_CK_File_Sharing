@@ -8,6 +8,18 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+
+# Test tấn công phát lại
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BURP = {
+    "http": "http://127.0.0.1:8080",
+    "https": "http://127.0.0.1:8080"
+}
+# ===============================
+
+
 # Cấu hình kết nối hệ thống phân tán
 AUTH_URL = "http://localhost:5002"
 FILE_URL = "http://localhost:5003"
@@ -94,12 +106,23 @@ def login():
     username = input("Tài khoản: ").strip()
     password = input("Mật khẩu: ").strip()
 
-    nonce, timestamp = generate_nonce_and_timestamp()
+    nonce, timestamp = generate_nonce_and_timestamp()  
     try:
         resp = requests.post(f"{AUTH_URL}/login", json={
             "username": username, "password": password,
             "nonce": nonce, "timestamp": timestamp
         })
+
+        # # Test tấn công phát lại
+        # resp = requests.post(
+        #     f"{AUTH_URL}/login", 
+        #     json={"username": username, "password": password, 
+        #           "nonce": nonce, "timestamp": timestamp},
+        #     proxies=BURP, 
+        #     verify=False 
+        # )
+        # #====================================
+        
         if resp.status_code == 200:
             session_ticket = resp.json().get("session_ticket")
             current_user = username

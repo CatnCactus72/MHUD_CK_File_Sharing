@@ -5,6 +5,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from cryptography.hazmat.backends import default_backend
 
 app = Flask(__name__)
 
@@ -20,6 +21,7 @@ INT_KEY_PATH = os.path.join(INT_CA_DIR, "int_key.pem")
 INT_CERT_PATH = os.path.join(INT_CA_DIR, "int_cert.pem")
 CRL_PATH = os.path.join(INT_CA_DIR, "crl.pem")
 
+REVOKED_SERIALS = set()
 
 def generate_ca_hierarchy(is_root=True, issuer_key=None, issuer_name=None):
     """Hàm bổ trợ sinh cặp khóa RSA và chứng chỉ X.509"""
@@ -99,6 +101,45 @@ def load_pki_credentials():
         root_cert = x509.load_pem_x509_certificate(f.read())
     return int_key, int_cert, root_cert
 
+def load_pki_credentials():
+    """Hàm bổ trợ để load khóa và chứng chỉ phục vụ cho việc ký duyệt"""
+    with open(INT_KEY_PATH, "rb") as k_file:
+        int_private_key = serialization.load_pem_private_key(
+            k_file.read(), password=None, backend=default_backend()
+        )
+    with open(INT_CERT_PATH, "rb") as c_file:
+        int_cert = x509.load_pem_x509_certificate(c_file.read(), default_backend())
+    return int_private_key, int_cert
+
+def update_crl_file():
+    """Trái tim của tiến trình thu hồi: Đọc danh sách số Serial bị block và đúc thành tệp crl.pem mới"""
+    int_private_key, int_cert = load_pki_credentials()
+    
+    # Khởi tạo Builder cho CRL số chuẩn X.509
+    builder = x509.CertificateRevocationListBuilder()
+    builder = builder.issuer_name(int_cert.subject)
+    builder = builder.last_update(datetime.datetime.utcnow())
+    builder = builder.next_update(datetime.datetime.utcnow() + datetime.timedelta(days=1)) # CRL có giá trị trong 1 ngày
+    
+    # Duyệt qua danh sách Serial đã bị đưa vào sổ đen để add vào phôi CRL
+    for serial in REVOKED_SERIALS:
+        revoked_cert = x509.RevokedCertificateBuilder().serial_number(
+            int(serial)
+        ).revocation_date(
+            datetime.datetime.utcnow()
+        ).build(default_backend())
+        builder = builder.add_revoked_certificate(revoked_cert)
+        
+    # Dùng khóa bí mật của Intermediate CA để đóng dấu ký số lên tệp CRL
+    crl = builder.sign(
+        private_key=int_private_key,
+        algorithm=hashes.SHA256(),
+        backend=default_backend()
+    )
+    
+    # Ghi đè file tĩnh crl.pem
+    with open(CRL_PATH, "wb") as f:
+        f.write(crl.public_bytes(serialization.Encoding.PEM))
 
 @app.route('/issue_cert', methods=['POST'])
 def issue_cert():
@@ -142,6 +183,31 @@ def issue_cert():
         return jsonify({"error": f"Lỗi trong quá trình cấp phát: {str(e)}"}), 500
 
 
+@app.route('/revoke_cert', methods=['POST'])
+def revoke_cert():
+    """Endpoint MỚI: Tiếp nhận yêu cầu thu hồi chứng chỉ từ số Serial"""
+    try:
+        data = request.get_json()
+        serial_number = data.get('serial_number')
+        
+        if not serial_number:
+            return jsonify({"error": "Thiếu tham số serial_number trong gói tin JSON"}), 400
+            
+        # Thêm số Serial này vào danh sách đen của hệ thống
+        REVOKED_SERIALS.add(int(serial_number))
+        
+        # Tạo lại file crl.pem mới ngay lập tức để cập nhật trạng thái
+        update_crl_file()
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Chứng chỉ có số Serial {serial_number} đã bị thu hồi thành công. Tệp CRL đã được làm mới."
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": f"Lỗi xử lý thu hồi nội bộ hệ thống CA: {str(e)}"}), 500
+
+
 @app.route('/crl', methods=['GET'])
 def get_crl():
     """Endpoint công khai để các Node và Client tải danh sách thu hồi chứng chỉ (CRL)"""
@@ -151,8 +217,8 @@ def get_crl():
         return Response(crl_data, mimetype='application/x-pem-file')
     except Exception as e:
         return jsonify({"error": "Không tìm thấy tệp danh sách thu hồi CRL"}), 404
-
-
+    
+    
 if __name__ == '__main__':
     # Bước 1: Chạy tiến trình kiểm tra/khởi tạo thư mục dữ liệu root_ca và intermediate_ca khi container boot
     initialize_pki_at_first_boot()
