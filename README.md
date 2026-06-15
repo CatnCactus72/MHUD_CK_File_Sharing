@@ -24,6 +24,31 @@
 
 * **python export_db.py**
 
+
+- Test tính năng chống tấn công phát lại đối với tính năng đăng nhập tài khoản:
+
+* Bước 1: command lại đoạn code resp = ... và thay bằng đoạn code resp = ... có chứa dòng "proxies=BURP, verify=False" 
+
+* Bước 2: mở ứng dụng Burp Suite community, vào tab Proxy, bật Intercept: On
+
+* Bước 3: chạy chương trình và thực hiện tính năng đăng nhập, sau khi nhập username và password, terminal sẽ dừng lại (do burp suite đã chặn gói tin)
+
+* Bước 4.1: Chuyển gói tin bắt được tới repeater, sau đó nhấn send 2-3 lần, sẽ xuất hiện gói tin HTTP response thông báo phát hiện tấn công phát lại (403)
+
+* Bước 4.2: giữ nguyên gói tin, đợi >5 phút rồi tiếp tục cho gói tin đi qua, lúc này terminal báo vượt quá timestamp và ngăn đăng nhập
+
+- Test tính năng thu hồi chứng chỉ
+
+* Bước 1: tạo một tài khoản mới có username đặt là "nannhan"
+
+* Bước 2: chạy chương trình client/get_serial.py, kết quả trả về là một số nguyên lớn. 
+
+* Bước 3: vào revoke.py, thay TARGET_SERIAL thành dãy số vừa nhận được
+
+* Bước 4: chạy chương trình revoke.py, chứng chỉ đã được thu hồi. Khi này thử đăng nhập sẽ thông báo:
+"[-] Từ chối đăng nhập: Certificate revoked. Access denied."
+
+
 ## Mục lục
 
 1. [Tổng quan dự án](#1-tổng-quan-dự-án)

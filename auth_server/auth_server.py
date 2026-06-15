@@ -114,35 +114,72 @@ def check_replay_attack(nonce, timestamp_str):
 
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.json
-    username, password, csr = data.get('username'), data.get('password'), data.get('csr')
-
-    if not all([username, password, csr]):
-        return jsonify({"error": "Thiếu dữ liệu đầu vào"}), 400
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT username FROM users WHERE username = %s", (username,))
-    if cursor.fetchone():
-        conn.close()
-        return jsonify({"error": "Username đã tồn tại"}), 409
-
     try:
-        ca_resp = requests.post(f"{CA_SERVER_URL}/issue_cert", json={"csr": csr})
-        if ca_resp.status_code != 200:
-            return jsonify({"error": "CA Server từ chối cấp chứng chỉ"}), 500
-        cert_chain = ca_resp.json().get('cert_chain')
+        data = request.get_json()
+        username = data.get("username")
+        password = data.get("password")
+        csr_pem = data.get("csr")
+        nonce = data.get("nonce")
+        timestamp = data.get("timestamp")
+
+        # Kiểm tra tính đầy đủ của tham số gói tin đầu vào
+        if not all([username, password, csr_pem, nonce, timestamp]):
+            return jsonify({"error": "Thiếu dữ liệu đầu vào bắt buộc"}), 400
+
+        # Xác thực chống tấn công phát lại (Replay Attack) thông qua Nonce Store
+        is_safe, msg = check_replay_attack(nonce, timestamp)
+        if not is_safe:
+            return jsonify({"error": msg}), 403
+
+        # 1. Giao tiếp liên máy chủ (Inter-server): Gửi CSR sang CA Server để xin ký duyệt
+        try:
+            ca_resp = requests.post(f"{CA_SERVER_URL}/issue_cert", json={"csr": csr_pem})
+            if ca_resp.status_code != 200:
+                return jsonify({"error": f"CA Server từ chối cấp phát: {ca_resp.text}"}), 500
+            
+            ca_data = ca_resp.json()
+        except requests.exceptions.ConnectionError:
+            return jsonify({"error": "Auth Server không thể kết nối mạng tới CA Server ở cổng 5001"}), 500
+
+        # SỬA LỖI TRỌNG TÂM: Tự động tương thích cả 2 tên biến 'certificate' và 'cert_pem'
+        user_cert = ca_data.get("certificate") or ca_data.get("cert_pem")
+        if not user_cert:
+            return jsonify({"error": f"Lỗi cấu trúc: Dữ liệu CA trả về thiếu trường chứng chỉ: {ca_data}"}), 500
+        
+        # Gộp chuỗi tin cậy (Chain of Trust) nếu CA Server có đính kèm
+        chain = ca_data.get("chain", "")
+        full_cert = user_cert
+        if chain:
+            full_cert += "\n" + chain
+
+        # 2. Đồng bộ lưu vết tài khoản mới vào cơ sở dữ liệu PostgreSQL
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        password_hash = generate_password_hash(password)
+        
+        try:
+            # Truy vấn an toàn sử dụng cú pháp %s của psycopg2 để đẩy chuỗi chứng chỉ vào DB
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, cert_pem) VALUES (%s, %s, %s)",
+                (username, password_hash, full_cert)
+            )
+            conn.commit()
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            return jsonify({"error": "Tên tài khoản (Username) này đã tồn tại trên hệ thống"}), 400
+        finally:
+            cursor.close()
+            conn.close()
+
+        # 3. Trả kết quả thành công về cho Client với định dạng phôi khớp hoàn toàn với client.py
+        return jsonify({
+            "certificate": user_cert,
+            "chain": chain
+        }), 200
+
     except Exception as e:
-        return jsonify({"error": f"Lỗi kết nối CA Server: {str(e)}"}), 500
-
-    password_hash = generate_password_hash(password)
-    cursor.execute("INSERT INTO users (username, password_hash, cert_pem) VALUES (%s, %s, %s)", 
-                   (username, password_hash, cert_chain))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"message": "Đăng ký thành công", "cert_chain": cert_chain}), 200
-
+        return jsonify({"error": f"Lỗi hệ thống nội bộ tại Auth Server: {str(e)}"}), 500
+    
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
@@ -182,7 +219,7 @@ def login():
         auth_priv_key = serialization.load_pem_private_key(f.read(), password=None)
 
     issued_at = datetime.datetime.utcnow()
-    expires_at = issued_at + datetime.timedelta(hours=2)
+    expires_at = issued_at + datetime.timedelta(hours=0.1)
 
     payload = {"username": username, "iat": issued_at, "exp": expires_at}
     session_ticket = jwt.encode(payload, auth_priv_key, algorithm="RS256")

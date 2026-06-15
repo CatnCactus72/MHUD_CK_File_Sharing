@@ -74,8 +74,10 @@ def register():
 
     print("[*] Đang gửi yêu cầu đăng ký định danh tới Auth Server (RA)...")
     try:
+        nonce, timestamp = generate_nonce_and_timestamp()
         resp = requests.post(f"{AUTH_URL}/register", json={
-            "username": username, "password": password, "csr": csr_pem
+            "username": username, "password": password, "csr": csr_pem,
+            "nonce": nonce, "timestamp": timestamp
         })
         if resp.status_code == 200:
             # --- SỬ DỤNG THƯ MỤC CÔ LẬP ---
@@ -89,7 +91,10 @@ def register():
                     encryption_algorithm=serialization.NoEncryption()
                 ))
             
-            cert_chain = resp.json().get("cert_chain")
+            data = resp.json()
+            user_cert = data.get("certificate", "")
+            chain = data.get("chain", "")
+            cert_chain = user_cert + ("\n" + chain if chain else "")
             with open(os.path.join(user_dir, f"{username}_cert.pem"), "w") as f:
                 f.write(cert_chain)
             print(f"[+] Đăng ký thành công! Khóa và chứng chỉ lưu tại: {user_dir}")

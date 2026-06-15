@@ -112,16 +112,15 @@ def load_pki_credentials():
     return int_private_key, int_cert
 
 def update_crl_file():
-    """Trái tim của tiến trình thu hồi: Đọc danh sách số Serial bị block và đúc thành tệp crl.pem mới"""
+    """Đọc danh sách số Serial bị block và đúc thành tệp crl.pem mới"""
+    # Gọi hàm load_pki_credentials() gốc của bạn để lấy khóa Intermediate
     int_private_key, int_cert = load_pki_credentials()
     
-    # Khởi tạo Builder cho CRL số chuẩn X.509
     builder = x509.CertificateRevocationListBuilder()
     builder = builder.issuer_name(int_cert.subject)
     builder = builder.last_update(datetime.datetime.utcnow())
-    builder = builder.next_update(datetime.datetime.utcnow() + datetime.timedelta(days=1)) # CRL có giá trị trong 1 ngày
+    builder = builder.next_update(datetime.datetime.utcnow() + datetime.timedelta(days=1))
     
-    # Duyệt qua danh sách Serial đã bị đưa vào sổ đen để add vào phôi CRL
     for serial in REVOKED_SERIALS:
         revoked_cert = x509.RevokedCertificateBuilder().serial_number(
             int(serial)
@@ -130,14 +129,12 @@ def update_crl_file():
         ).build(default_backend())
         builder = builder.add_revoked_certificate(revoked_cert)
         
-    # Dùng khóa bí mật của Intermediate CA để đóng dấu ký số lên tệp CRL
     crl = builder.sign(
         private_key=int_private_key,
         algorithm=hashes.SHA256(),
         backend=default_backend()
     )
     
-    # Ghi đè file tĩnh crl.pem
     with open(CRL_PATH, "wb") as f:
         f.write(crl.public_bytes(serialization.Encoding.PEM))
 
@@ -148,65 +145,74 @@ def issue_cert():
     Trả về toàn bộ chuỗi chứng chỉ: User Cert -> Intermediate Cert -> Root Cert
     """
     try:
-        data = request.json
-        csr_pem = data.get('csr')
+        data = request.get_json()
+        csr_pem = data.get("csr")
         if not csr_pem:
-            return jsonify({"error": "Yêu cầu thiếu dữ liệu CSR"}), 400
+            return jsonify({"error": "Không tìm thấy dữ liệu CSR"}), 400
 
-        # Đọc và xác thực chữ ký của CSR gửi lên
-        csr = x509.load_pem_x509_csr(csr_pem.encode('utf-8'))
+        # 1. Giải mã và nạp đơn CSR
+        csr = x509.load_pem_x509_csr(csr_pem.encode('utf-8'), default_backend())
+
+        # 2. Kiểm tra chữ ký Proof-of-Possession trên đơn CSR
         if not csr.is_signature_valid:
-            return jsonify({"error": "Chữ ký trên CSR không hợp lệ"}), 400
+            return jsonify({"error": "Chữ ký CSR không hợp lệ (Bị giả mạo)"}), 400
 
-        # Tải cấu hình khóa từ bộ nhớ bảo mật của thư mục cục bộ
-        int_key, int_cert, root_cert = load_pki_credentials()
+        # 3. Load khóa bí mật của Intermediate CA để chuẩn bị ký
+        int_private_key, int_cert = load_pki_credentials()
 
-        # Tiến hành ký cấp phát chứng chỉ người dùng từ quyền Intermediate CA
+        # 4. Khởi tạo phôi chứng chỉ cho User
         builder = x509.CertificateBuilder()
         builder = builder.subject_name(csr.subject)
         builder = builder.issuer_name(int_cert.subject)
         builder = builder.public_key(csr.public_key())
-        builder = builder.serial_number(x509.random_serial_number())
+        builder = builder.serial_number(x509.random_serial_number()) # Số Serial ngẫu nhiên
         builder = builder.not_valid_before(datetime.datetime.utcnow())
-        builder = builder.not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365)) # Hiệu lực 1 năm
-        
-        user_cert = builder.sign(private_key=int_key, algorithm=hashes.SHA256())
+        builder = builder.not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365)) # Hạn 1 năm
 
-        # Gộp toàn bộ dữ liệu thành một chuỗi chứng chỉ hoàn chỉnh (Chain Certificate)
-        chain_pem = user_cert.public_bytes(serialization.Encoding.PEM) + \
-                    int_cert.public_bytes(serialization.Encoding.PEM) + \
-                    root_cert.public_bytes(serialization.Encoding.PEM)
+        # 5. Ký phát hành chứng chỉ bằng khóa của Intermediate CA
+        certificate = builder.sign(
+            private_key=int_private_key,
+            algorithm=hashes.SHA256(),
+            backend=default_backend()
+        )
 
-        return jsonify({"cert_chain": chain_pem.decode('utf-8')}), 200
+        # 6. Đọc tệp Root và Intermediate để tạo Chuỗi tin cậy (Chain of Trust)
+        with open(ROOT_CERT_PATH, "rb") as f:
+            root_cert_pem = f.read().decode('utf-8')
+        with open(INT_CERT_PATH, "rb") as f:
+            int_cert_pem = f.read().decode('utf-8')
+
+        chain_pem = int_cert_pem + root_cert_pem
+
+        # 7. Trả về chứng chỉ và chuỗi tin cậy
+        return jsonify({
+            "certificate": certificate.public_bytes(serialization.Encoding.PEM).decode('utf-8'),
+            "chain": chain_pem
+        }), 200
 
     except Exception as e:
-        return jsonify({"error": f"Lỗi trong quá trình cấp phát: {str(e)}"}), 500
-
+        return jsonify({"error": f"Lỗi nội bộ CA Server: {str(e)}"}), 500
 
 @app.route('/revoke_cert', methods=['POST'])
 def revoke_cert():
-    """Endpoint MỚI: Tiếp nhận yêu cầu thu hồi chứng chỉ từ số Serial"""
+    """Endpoint tiếp nhận lệnh thu hồi từ Admin/Client"""
     try:
         data = request.get_json()
         serial_number = data.get('serial_number')
         
         if not serial_number:
-            return jsonify({"error": "Thiếu tham số serial_number trong gói tin JSON"}), 400
+            return jsonify({"error": "Thiếu tham số serial_number"}), 400
             
-        # Thêm số Serial này vào danh sách đen của hệ thống
         REVOKED_SERIALS.add(int(serial_number))
-        
-        # Tạo lại file crl.pem mới ngay lập tức để cập nhật trạng thái
         update_crl_file()
         
         return jsonify({
             "status": "success",
-            "message": f"Chứng chỉ có số Serial {serial_number} đã bị thu hồi thành công. Tệp CRL đã được làm mới."
+            "message": f"Chứng chỉ có số Serial {serial_number} đã bị thu hồi."
         }), 200
         
     except Exception as e:
-        return jsonify({"error": f"Lỗi xử lý thu hồi nội bộ hệ thống CA: {str(e)}"}), 500
-
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/crl', methods=['GET'])
 def get_crl():
